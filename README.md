@@ -1,6 +1,6 @@
 # Trading Brain Conflict Resolutions
 
-This repository includes updates to address seven conflicts in the AI brain decision pipeline. The fixes focus on preventing runtime mismatches, invalid market inputs, and unsafe trade calculations.
+This repository includes updates to address conflicts in the AI brain decision pipeline. The fixes focus on preventing runtime mismatches, invalid market inputs, and unsafe trade calculations in `ai_brain.py`.
 
 ## Resolved Conflicts (7)
 1. **Empty input protection**: Rejects decisions when H1/H4/D1 data is empty or missing entirely.  

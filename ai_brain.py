@@ -1,6 +1,6 @@
 from market_context import MarketContextAnalyzer
 from pattern_recognition import PatternRecognizer
-from trade_validator import TradeValidator, TradeDecision
+from trade_validator import TradeValidator
 from adaptive_risk import AdaptiveRiskManager
 from trading_memory import TradingMemory
 import pandas as pd
@@ -43,7 +43,7 @@ class AIBrain:
         if missing:
             raise ValueError(f"symbol_info missing fields: {', '.join(missing)}")
 
-    def _fallback_stop_loss(self, pattern, data_h1: pd.DataFrame, price: float) -> float:
+    def _fallback_stop_loss(self, pattern, data_h1: pd.DataFrame) -> float:
         lookback = data_h1.tail(20)
         if pattern.direction == "bullish":
             return float(lookback["low"].min())
@@ -92,7 +92,6 @@ class AIBrain:
         # 3. Validation & Selection
         best_decision = None
         best_pattern = None
-        best_feat = None
         best_rationale = []
         
         for pattern in fresh_patterns:
@@ -120,7 +119,7 @@ class AIBrain:
         price = data_h1['close'].iloc[-1]
         sl = best_pattern.details.get('stop_loss')
         if sl is None:
-            sl = self._fallback_stop_loss(best_pattern, data_h1, price)
+            sl = self._fallback_stop_loss(best_pattern, data_h1)
         sl = float(sl)
         target_distance = best_pattern.details.get('height', 0)
 
