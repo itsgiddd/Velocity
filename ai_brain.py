@@ -3,6 +3,7 @@ from pattern_recognition import PatternRecognizer
 from trade_validator import TradeValidator, TradeDecision
 from adaptive_risk import AdaptiveRiskManager
 from trading_memory import TradingMemory
+import numpy as np
 import pandas as pd
 
 class AIBrain:
@@ -29,6 +30,7 @@ class AIBrain:
             "tone": "direct",
         }
         self.decision_policy = decision_policy or DecisionPolicy()
+        self.feature_builder = PatternFeatureBuilder()
 
     def _sanitize_data(self, data: pd.DataFrame, name: str) -> pd.DataFrame:
         if data is None or data.empty:
@@ -117,7 +119,8 @@ class AIBrain:
         best_pattern, best_decision, best_rationale = self.decision_policy.select_best(
             fresh_patterns,
             market_state,
-            self.trade_validator
+            self.trade_validator,
+            self.feature_builder
         )
         
         if not best_decision or not best_decision.should_trade:
@@ -193,13 +196,46 @@ class AIBrain:
         self.memory.close_trade(symbol, profit)
 
 
+QUALITY_GRADE_MAP = {
+    "A": 1.0,
+    "B": 0.75,
+    "C": 0.5,
+    "D": 0.25,
+}
+
+
+class PatternFeatureBuilder:
+    def build_features(self, pattern, market_state: dict) -> list[float]:
+        trend_alignment = 1.0 if (
+            market_state.get("global_trend", 0) == 1 and pattern.direction == "bullish"
+            or market_state.get("global_trend", 0) == -1 and pattern.direction == "bearish"
+        ) else 0.0
+        quality = QUALITY_GRADE_MAP.get(pattern.quality_grade, 0.5)
+        return [
+            float(pattern.confidence),
+            float(pattern.push_count),
+            float(pattern.volume_score),
+            quality,
+            float(market_state.get("strength", 0)),
+            float(market_state.get("session", 0)),
+            float(market_state.get("momentum_h1", 0)),
+            trend_alignment,
+        ]
+
+
 class DecisionPolicy:
     """
     Strategy hook for selecting the best trade candidate.
     Swap this with an ML/LLM-driven policy to let the system evolve
     beyond deterministic heuristics.
     """
-    def select_best(self, patterns, market_state: dict, validator: TradeValidator):
+    def select_best(
+        self,
+        patterns,
+        market_state: dict,
+        validator: TradeValidator,
+        feature_builder: PatternFeatureBuilder,
+    ):
         best_decision = None
         best_pattern = None
         best_rationale = []
@@ -212,6 +248,40 @@ class DecisionPolicy:
                     best_decision = decision
                     best_pattern = pattern
                     best_rationale = decision.rationale
+
+        return best_pattern, best_decision, best_rationale
+
+
+class TensorFlowDecisionPolicy(DecisionPolicy):
+    """
+    Uses a TensorFlow/Keras model to score pattern setups.
+    The model should be trained on the same feature order as PatternFeatureBuilder.
+    """
+    def __init__(self, model, threshold: float = 0.6):
+        self.model = model
+        self.threshold = threshold
+
+    def select_best(
+        self,
+        patterns,
+        market_state: dict,
+        validator: TradeValidator,
+        feature_builder: PatternFeatureBuilder,
+    ):
+        best_decision = None
+        best_pattern = None
+        best_rationale = []
+        best_score = -1.0
+
+        for pattern in patterns:
+            features = feature_builder.build_features(pattern, market_state)
+            score = float(self.model.predict(np.array([features]), verbose=0)[0][0])
+            decision = validator.validate(pattern, market_state, {"vol_anomaly": pattern.volume_score * 2})
+            if decision.should_trade and score >= self.threshold and score > best_score:
+                best_score = score
+                best_decision = decision
+                best_pattern = pattern
+                best_rationale = decision.rationale + [f"Model score: {score:.2f}"]
 
         return best_pattern, best_decision, best_rationale
 

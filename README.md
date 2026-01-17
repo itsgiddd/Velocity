@@ -32,3 +32,19 @@ Use `pattern_training.py` to build a dataset from historical H1/H4/D1 candles an
    model, history = train_tensorflow_model(samples, epochs=30, batch_size=64)
    model.save("fx_pattern_model.keras")
    ```
+
+## TensorFlow Policy Integration
+To resolve the policy mismatch between training and live selection, use the `TensorFlowDecisionPolicy`
+so the AI brain scores patterns with the trained model.
+
+```python
+from ai_brain import AIBrain, TensorFlowDecisionPolicy
+from tensorflow.keras.models import load_model
+
+model = load_model("fx_pattern_model.keras")
+policy = TensorFlowDecisionPolicy(model, threshold=0.6)
+brain = AIBrain(decision_policy=policy)
+```
+
+The policy uses the same feature order as `PatternFeatureBuilder` and `build_pattern_dataset`
+to keep training and inference aligned.
