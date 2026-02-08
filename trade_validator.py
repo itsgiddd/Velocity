@@ -1,6 +1,6 @@
-<<<<<<< Updated upstream
 from dataclasses import dataclass, field
 from typing import List
+
 
 @dataclass
 class TradeDecision:
@@ -10,98 +10,97 @@ class TradeDecision:
     confidence: float = 0.0
     rationale: List[str] = field(default_factory=list)
 
+
 class TradeValidator:
     """
-    The 'Pre-Frontal Cortex' - Performs sanity checks and confluence scoring.
+    Performs confluence checks before execution.
     """
-    
-    def validate(self, pattern, market_state: dict, features: dict) -> TradeDecision:
-        reasons = []
-        score = 0
-        
-        # 1. Trend Alignment (Critical)
-        # If D1 trend exists, MUST align.
-        global_trend = market_state.get('global_trend', 0)
-        trend_score = 0
-        if global_trend == 1 and pattern.direction == "bullish": trend_score = 1
-        elif global_trend == -1 and pattern.direction == "bearish": trend_score = 1
-        elif global_trend == 0: trend_score = 0 # Range
-        
-        # If strong trend against us -> Reject
-        if global_trend == 1 and pattern.direction == "bearish":
-            return TradeDecision(False, "Against D1 Uptrend", rationale=["Rejected: trend against trade"])
-        if global_trend == -1 and pattern.direction == "bullish":
-            return TradeDecision(False, "Against D1 Downtrend", rationale=["Rejected: trend against trade"])
-            
-        if trend_score == 1:
-            score += 2 # Strong weight for trend
-            reasons.append("Aligned with D1 trend (+2)")
-        else:
-            reasons.append("No D1 trend alignment (+0)")
-        
-        # 2. Push Count (Pattern Strength)
-        push_count = getattr(pattern, 'push_count', 1) 
-        if push_count >= 2: score += 1
-        if push_count >= 3: score += 1 # Bonus
-        
-        if push_count < 1: 
-             return TradeDecision(False, "Push Count < 1", rationale=["Rejected: insufficient pushes"])
 
-        if push_count >= 4:
-            return TradeDecision(False, "Push Exhaustion (>=4 pushes)", rationale=["Rejected: push exhaustion"])
-        reasons.append(f"Push count {push_count} (+{1 if push_count >= 2 else 0}{'+1' if push_count >= 3 else ''})")
-             
-        # 3. Volume Confirmation
-        vol_score = getattr(pattern, 'volume_score', 0.5)
-        # Or use feature 'vol_anomaly'
-        vol_anomaly = features.get('vol_anomaly', 1.0)
-        if vol_anomaly > 1.5:
-            score += 1
-            reasons.append("Volume expansion (+1)")
+    def _normalize_trend(self, raw_trend) -> int:
+        if isinstance(raw_trend, str):
+            t = raw_trend.lower()
+            if t in {"bullish", "up", "long"}:
+                return 1
+            if t in {"bearish", "down", "short"}:
+                return -1
+            return 0
+        if isinstance(raw_trend, (int, float)):
+            if raw_trend > 0:
+                return 1
+            if raw_trend < 0:
+                return -1
+        return 0
+
+    def validate(self, pattern, market_state: dict, features: dict) -> TradeDecision:
+        reasons: List[str] = []
+        score = 0
+
+        direction = getattr(pattern, "direction", "neutral")
+        ai_conf = float(getattr(pattern, "confidence", 0.0))
+
+        global_trend = self._normalize_trend(market_state.get("global_trend", 0))
+        if global_trend == 1 and direction == "bearish":
+            return TradeDecision(False, "Against higher timeframe uptrend", rationale=["Rejected: trend conflict"])
+        if global_trend == -1 and direction == "bullish":
+            return TradeDecision(False, "Against higher timeframe downtrend", rationale=["Rejected: trend conflict"])
+
+        if global_trend == 1 and direction == "bullish":
+            score += 2
+            reasons.append("Aligned with higher timeframe uptrend (+2)")
+        elif global_trend == -1 and direction == "bearish":
+            score += 2
+            reasons.append("Aligned with higher timeframe downtrend (+2)")
         else:
-            reasons.append("No volume expansion (+0)")
-        
-        # 4. Pattern Confidence (AI Probability)
-        ai_conf = pattern.confidence
+            reasons.append("No higher timeframe trend boost (+0)")
+
+        push_count = int(max(getattr(pattern, "push_count", 1), 0))
+        if push_count < 1:
+            return TradeDecision(False, "Push count below 1", rationale=["Rejected: no impulse structure"])
+        if push_count >= 4:
+            return TradeDecision(False, "Push exhaustion (>=4)", rationale=["Rejected: exhausted structure"])
+        if push_count >= 2:
+            score += 1
+        if push_count >= 3:
+            score += 1
+        reasons.append(f"Push count {push_count} (+{1 if push_count >= 2 else 0}{'+1' if push_count >= 3 else ''})")
+
+        vol_anomaly = float(features.get("vol_anomaly", 1.0))
+        volume_score = float(getattr(pattern, "volume_score", 0.5))
+        if vol_anomaly > 1.5 or volume_score > 0.6:
+            score += 1
+            reasons.append("Volume confirms move (+1)")
+        else:
+            reasons.append("Weak volume confirmation (+0)")
+
         if ai_conf > 0.6:
             score += 1
             reasons.append("Pattern confidence > 0.6 (+1)")
         else:
             reasons.append("Pattern confidence <= 0.6 (+0)")
-        
-        # 5. Session
-        if market_state.get('session', 0) > 0.6:
+
+        session_score = float(market_state.get("session", 0.0))
+        if session_score > 0.6:
             score += 1
             reasons.append("Session quality high (+1)")
         else:
             reasons.append("Session quality low (+0)")
-        
-        # 6. Market Strength
-        if market_state.get('strength', 0) > 20:
+
+        strength_score = float(market_state.get("strength", 0.0))
+        if strength_score > 1.0:
+            strength_score = strength_score / 100.0
+        if strength_score > 0.4:
             score += 1
-            reasons.append("Market strength strong (+1)")
+            reasons.append("Market strength supportive (+1)")
         else:
             reasons.append("Market strength weak (+0)")
-        
-        # Decision
-        # REQUIRE 5+ (Strict)
-        if score >= 5:
-            if pattern.direction == "neutral":
-                 return TradeDecision(False, "Rejected Neutral Pattern", score, ai_conf, reasons + ["Rejected: neutral direction"])
-            return TradeDecision(True, "High Confluence", score, ai_conf, reasons + ["Approved: confluence threshold met"])
-        else:
-            reasons.append("Rejected: confluence below threshold")
-            return TradeDecision(False, f"Low Confluence (Score {score}/8)", score, ai_conf, reasons)
-=======
-class TradeDecision:
-    def __init__(self, should_trade, confidence, rejection_reason, confluence_score):
-        self.should_trade = should_trade
-        self.confidence = confidence
-        self.rejection_reason = rejection_reason
-        self.confluence_score = confluence_score
 
-class TradeValidator:
-    def validate(self, pattern, market_state, features):
-        score = 0.8
-        return TradeDecision(True, 0.8, None, 100)
->>>>>>> Stashed changes
+        if direction == "neutral":
+            reasons.append("Rejected: neutral direction")
+            return TradeDecision(False, "Neutral pattern", score, ai_conf, reasons)
+
+        if score >= 5:
+            reasons.append("Approved: confluence threshold met")
+            return TradeDecision(True, "High confluence", score, ai_conf, reasons)
+
+        reasons.append("Rejected: confluence below threshold")
+        return TradeDecision(False, f"Low confluence ({score}/8)", score, ai_conf, reasons)

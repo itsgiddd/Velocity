@@ -27,8 +27,8 @@ from dataclasses import dataclass
 from enum import Enum
 
 # Import app modules
-from .mt5_connector import MT5Connector
-from .model_manager import NeuralModelManager
+from mt5_connector import MT5Connector
+from model_manager import NeuralModelManager
 
 class TradingSignal:
     """Trading signal data structure"""
@@ -82,7 +82,7 @@ class TradingEngine:
         # Trading parameters
         self.risk_per_trade = risk_per_trade  # 1.5% default
         self.confidence_threshold = confidence_threshold  # 65% default
-        self.trading_pairs = trading_pairs or ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD']
+        self.trading_pairs = trading_pairs or ['USDJPY']  # Only USDJPY
         self.max_concurrent_positions = max_concurrent_positions
         
         # Trading state
@@ -283,16 +283,15 @@ class TradingEngine:
             return None
     
     def _extract_features(self, market_data: Dict[str, Any]) -> Optional[np.ndarray]:
-        """Extract features for neural network"""
+        """Extract 10 features for enhanced neural network"""
         try:
-            features = []
-            
             # Use M15 as primary timeframe
             if 'M15' not in market_data:
                 return None
             
             m15_data = market_data['M15']
-            if len(m15_data) < 20:
+            if len(m15_data) < 20:  # Reduced requirement for real-time trading
+                self.logger.warning(f"Insufficient data: {len(m15_data)} points (need 20+)")
                 return None
             
             # Convert to DataFrame for easier analysis
@@ -300,45 +299,111 @@ class TradingEngine:
             df['time'] = pd.to_datetime(df['time'])
             df.set_index('time', inplace=True)
             
-            # Calculate technical indicators
-            df['sma_5'] = df['close'].rolling(5).mean()
-            df['sma_20'] = df['close'].rolling(20).mean()
-            df['rsi'] = self._calculate_rsi(df['close'])
-            df['returns'] = df['close'].pct_change()
-            df['volatility'] = df['returns'].rolling(20).std()
+            # Calculate comprehensive technical indicators (same as enhanced training)
             
-            # Get latest values
+            # 1. Price momentum (10-period)
+            df['price_momentum'] = df['close'] / df['close'].shift(10) - 1
+            
+            # 2. Z-score (price deviation from 20-period mean)
+            df['price_zscore'] = (df['close'] - df['close'].rolling(20).mean()) / df['close'].rolling(20).std()
+            
+            # 3. SMA ratios
+            df['sma_5'] = df['close'].rolling(5).mean()
+            df['sma_15'] = df['close'].rolling(15).mean()
+            df['sma_5_ratio'] = df['sma_5'] / df['close'] - 1
+            df['sma_20_ratio'] = df['sma_15'] / df['close'] - 1
+            
+            # 4. RSI
+            df['rsi'] = self._calculate_rsi(df['close'])
+            
+            # 5. Volatility (annualized)
+            df['returns'] = df['close'].pct_change()
+            df['volatility'] = df['returns'].rolling(10).std() * np.sqrt(252)
+            
+            # 6. Trend strength (10-period)
+            df['trend_strength'] = df['close'] / df['close'].shift(10) - 1
+            
+            # 7. Bollinger Bands position
+            df['bb_middle'] = df['close'].rolling(15).mean()
+            df['bb_std'] = df['close'].rolling(15).std()
+            df['bb_upper'] = df['bb_middle'] + (df['bb_std'] * 2)
+            df['bb_lower'] = df['bb_middle'] - (df['bb_std'] * 2)
+            df['bb_position'] = (df['close'] - df['bb_lower']) / (df['bb_upper'] - df['bb_lower'])
+            
+            # 8-10. Candlestick Pattern Recognition
+            df['trend_continuation_score'] = 0.0
+            df['trend_reversal_score'] = 0.0
+            
+            # Calculate consecutive candles for pattern recognition
+            for i in range(4, len(df)):
+                consecutive_bullish = 0
+                consecutive_bearish = 0
+                
+                # Count consecutive bullish candles
+                for j in range(i, max(0, i-5), -1):
+                    if df.iloc[j]['close'] > df.iloc[j]['open']:
+                        consecutive_bullish += 1
+                    else:
+                        break
+                
+                # Count consecutive bearish candles  
+                for j in range(i, max(0, i-5), -1):
+                    if df.iloc[j]['close'] < df.iloc[j]['open']:
+                        consecutive_bearish += 1
+                    else:
+                        break
+                
+                # Pattern scores (normalized)
+                df.loc[i, 'trend_continuation_score'] = min(consecutive_bullish, consecutive_bearish, 4) / 4.0
+                df.loc[i, 'trend_reversal_score'] = min(consecutive_bullish, consecutive_bearish, 3) / 3.0
+            
+            # Get latest values (remove NaN)
             latest = df.iloc[-1]
             
-            # Create feature vector
-            current_price = latest['close']
-            prev_price = df.iloc[-2]['close']
+            # Handle NaN values with fallbacks
+            required_features = ['price_momentum', 'price_zscore', 'sma_5_ratio', 'sma_20_ratio', 
+                                'rsi', 'volatility', 'trend_strength', 'bb_position', 
+                                'trend_continuation_score', 'trend_reversal_score']
             
-            # Price features
-            price_change = (current_price - prev_price) / prev_price
-            z_score = (current_price - df['close'].mean()) / df['close'].std()
+            # Fill NaN values with reasonable defaults
+            latest_filled = latest.copy()
             
-            # SMA features
-            sma_5_ratio = latest['sma_5'] / current_price - 1
-            sma_20_ratio = latest['sma_20'] / current_price - 1
+            # Set defaults for missing indicators
+            if pd.isna(latest['price_momentum']):
+                latest_filled['price_momentum'] = 0.0
+            if pd.isna(latest['price_zscore']):
+                latest_filled['price_zscore'] = 0.0
+            if pd.isna(latest['sma_5_ratio']):
+                latest_filled['sma_5_ratio'] = 0.0
+            if pd.isna(latest['sma_20_ratio']):
+                latest_filled['sma_20_ratio'] = 0.0
+            if pd.isna(latest['rsi']):
+                latest_filled['rsi'] = 50.0  # Neutral RSI
+            if pd.isna(latest['volatility']):
+                latest_filled['volatility'] = 0.01  # Default volatility
+            if pd.isna(latest['trend_strength']):
+                latest_filled['trend_strength'] = 0.0
+            if pd.isna(latest['bb_position']):
+                latest_filled['bb_position'] = 0.5  # Middle of bands
+            if pd.isna(latest['trend_continuation_score']):
+                latest_filled['trend_continuation_score'] = 0.0
+            if pd.isna(latest['trend_reversal_score']):
+                latest_filled['trend_reversal_score'] = 0.0
             
-            # Technical indicators
-            rsi_norm = latest['rsi'] / 100.0
-            volatility_norm = latest['volatility'] * 100
-            
+            # Create 6-feature vector for neural model
             features = [
-                price_change,
-                z_score,
-                sma_5_ratio,
-                sma_20_ratio,
-                rsi_norm,
-                volatility_norm
+                latest_filled['price_momentum'],           # 1. Price momentum
+                latest_filled['price_zscore'],              # 2. Z-score
+                latest_filled['sma_5_ratio'],              # 3. SMA 5 ratio
+                latest_filled['sma_20_ratio'],              # 4. SMA 20 ratio
+                latest_filled['rsi'],                       # 5. RSI
+                latest_filled['volatility']                 # 6. Volatility
             ]
             
             return np.array(features)
             
         except Exception as e:
-            self.logger.error(f"Error extracting features: {e}")
+            self.logger.error(f"Error extracting 10 features: {e}")
             return None
     
     def _calculate_rsi(self, prices: pd.Series, period: int = 14) -> pd.Series:
@@ -351,25 +416,33 @@ class TradingEngine:
     
     def _calculate_sl_tp(self, symbol: str, action: str, entry_price: float, 
                          symbol_info: Dict[str, Any]) -> Tuple[float, float]:
-        """Calculate stop loss and take profit levels"""
+        """Calculate stop loss and take profit levels - USDJPY 20-30 pip strategy"""
         try:
-            spread = symbol_info['spread'] * symbol_info['point']
+            # USDJPY pip-based calculation for 20-30 pip profit targets
+            if 'JPY' in symbol:
+                # JPY pairs: pip = 0.01
+                pip_value = 0.01
+            else:
+                # Non-JPY pairs: pip = 0.0001  
+                pip_value = 0.0001
             
-            # Base SL/TP calculation
             if action == 'BUY':
-                stop_loss = entry_price - (spread * 30)  # 30 spread stop loss
-                take_profit = entry_price + (spread * 60)  # 60 spread take profit
+                # Quick scalping: 20 pip profit target, 15 pip stop loss
+                take_profit = entry_price + (pip_value * 20)  # 20 pips profit
+                stop_loss = entry_price - (pip_value * 15)   # 15 pips risk
             else:  # SELL
-                stop_loss = entry_price + (spread * 30)
-                take_profit = entry_price - (spread * 60)
+                take_profit = entry_price - (pip_value * 20)  # 20 pips profit
+                stop_loss = entry_price + (pip_value * 15)   # 15 pips risk
             
-            # Adjust for JPY pairs
+            # Adjust rounding based on pair type
             if 'JPY' in symbol:
                 stop_loss = round(stop_loss, 3)
                 take_profit = round(take_profit, 3)
             else:
                 stop_loss = round(stop_loss, 5)
                 take_profit = round(take_profit, 5)
+            
+            self.logger.info(f"{symbol} {action}: Entry={entry_price:.5f}, SL={stop_loss:.5f}, TP={take_profit:.5f}")
             
             return stop_loss, take_profit
             
@@ -548,50 +621,21 @@ class TradingEngine:
             self.logger.error(f"Error updating positions: {e}")
     
     def _should_close_position(self, position: Position, mt5_pos: Dict[str, Any]) -> bool:
-        """Determine if position should be closed with intelligent profit protection"""
+        """Simple pip-based exit - Close at TP or SL for USDJPY 20-30 pip strategy"""
         try:
             current_price = mt5_pos['price_current']
             
-            # Always check hard stop loss first
-            if self._is_stop_loss_hit(position, current_price):
-                self.logger.info(f"Hard stop loss hit for {position.symbol}")
-                return True
-            
-            # Check if take profit is reached
+            # Check if take profit is reached (20 pips profit)
             if self._is_take_profit_hit(position, current_price):
-                self.logger.info(f"Take profit reached for {position.symbol}")
+                self.logger.info(f"Take profit reached for {position.symbol} - 20 pips profit!")
                 return True
             
-            # Intelligent profit protection logic
-            profit_pct = self._calculate_profit_percentage(position, current_price)
-            time_open = (datetime.now() - position.open_time).total_seconds() / 3600  # hours
-            
-            # 1. Trailing Stop Logic: Move stop loss up when in significant profit
-            if profit_pct > 0.5:  # 0.5% profit threshold
-                if self._should_activate_trailing_stop(position, current_price):
-                    self.logger.info(f"Trailing stop activated for {position.symbol}")
-                    return True
-            
-            # 2. Time-Based Exit: Close positions that stagnate too long
-            if self._should_exit_by_time(profit_pct, time_open):
-                self.logger.info(f"Time-based exit triggered for {position.symbol} (open {time_open:.1f}h)")
+            # Check if stop loss is hit (15 pips loss)
+            if self._is_stop_loss_hit(position, current_price):
+                self.logger.info(f"Stop loss hit for {position.symbol} - 15 pips loss")
                 return True
             
-            # 3. Profit Stagnation: Exit if significant profit isn't advancing
-            if self._should_exit_profit_stagnation(position, current_price):
-                self.logger.info(f"Profit stagnation exit for {position.symbol}")
-                return True
-            
-            # 4. Market Reversal Signals: Exit when trend weakens
-            if self._should_exit_market_reversal(position, current_price):
-                self.logger.info(f"Market reversal exit for {position.symbol}")
-                return True
-            
-            # 5. Partial Profit Taking: Take profits in stages
-            if self._should_take_partial_profit(position, current_price):
-                self.logger.info(f"Partial profit taken for {position.symbol}")
-                # This would implement partial closing logic
-            
+            # No other exit conditions - let the trade run to TP or SL
             return False
             
         except Exception as e:
@@ -697,6 +741,244 @@ class TradingEngine:
             self.logger.error(f"Error in profit stagnation check: {e}")
             return False
     
+    def _is_trade_dropping_after_peak(self, position: Position, current_price: float) -> bool:
+        """Detect if trade has peaked and is dropping back down"""
+        try:
+            # Get price history to analyze peak detection
+            market_data = self._get_recent_prices(position.symbol, 100)
+            if not market_data or len(market_data) < 20:
+                return False
+            
+            current_profit = self._calculate_profit_percentage(position, current_price)
+            
+            # Find the peak profit achieved during this trade
+            peak_profit = 0.0
+            peak_price = 0.0
+            
+            for i, price_data in enumerate(market_data[-50:]):  # Last 50 candles
+                price = price_data['close']
+                if position.action == 'BUY':
+                    profit = (price - position.entry_price) / position.entry_price * 100
+                else:  # SELL
+                    profit = (position.entry_price - price) / position.entry_price * 100
+                
+                if profit > peak_profit:
+                    peak_profit = profit
+                    peak_price = price
+            
+            # Only consider if we're still in decent profit
+            if current_profit < 0.5:  # Less than 0.5% profit
+                return False
+            
+            # Check if we've dropped significantly from peak
+            if peak_profit < 0.8:  # Peak was less than 0.8%
+                return False
+            
+            # Calculate how much we've dropped from peak
+            profit_drop = peak_profit - current_profit
+            
+            # Only trigger if we've given back at least 50% of peak profit
+            # AND the current profit is still reasonable (not back to break-even)
+            if profit_drop >= peak_profit * 0.5 and current_profit >= 0.3:
+                self.logger.info(f"Peak detection: Peak {peak_profit:.2f}%, Current {current_profit:.2f}%, Drop {profit_drop:.2f}%")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"Error in peak detection: {e}")
+            return False
+    
+    def _should_exit_only_if_most_profit_given_back(self, position: Position, current_price: float) -> bool:
+        """Very conservative - only exit if we've given back MOST of peak profit"""
+        try:
+            # Get price history
+            market_data = self._get_recent_prices(position.symbol, 100)
+            if not market_data or len(market_data) < 20:
+                return False
+            
+            current_profit = self._calculate_profit_percentage(position, current_price)
+            
+            # Find the peak profit
+            peak_profit = 0.0
+            for price_data in market_data[-50:]:  # Last 50 candles
+                price = price_data['close']
+                if position.action == 'BUY':
+                    profit = (price - position.entry_price) / position.entry_price * 100
+                else:  # SELL
+                    profit = (position.entry_price - price) / position.entry_price * 100
+                
+                if profit > peak_profit:
+                    peak_profit = profit
+            
+            # Very conservative thresholds
+            if peak_profit < 1.0:  # Only consider if peak was >1%
+                return False
+            
+            # Only exit if we've given back 70% of peak profit AND current profit < 0.4%
+            profit_remaining = peak_profit - current_profit
+            if profit_remaining >= peak_profit * 0.7 and current_profit < 0.4:
+                self.logger.info(f"Conservative exit: Peak {peak_profit:.2f}%, Current {current_profit:.2f}%, Given back {profit_remaining:.2f}%")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"Error in conservative profit protection: {e}")
+            return False
+        """AGGRESSIVE trailing stop - protect profits much earlier"""
+        profit_pct = self._calculate_profit_percentage(position, current_price)
+        
+        # AGGRESSIVE thresholds for profit protection
+        if profit_pct >= 0.3:  # Any profit above 0.3%
+            # Move to break-even IMMEDIATELY for any profit
+            if profit_pct <= 0.8:  # For smaller profits
+                buffer = 0.1 if position.action == 'BUY' else -0.1  # Smaller buffer
+                new_stop = position.entry_price + buffer
+                
+                if position.action == 'BUY':
+                    return current_price <= new_stop
+                else:  # SELL
+                    return current_price >= new_stop
+            
+            # For larger profits, trail very closely
+            elif profit_pct > 0.8:
+                # Trail behind by only 0.2% (very tight)
+                trail_distance = 0.002
+                if position.action == 'BUY':
+                    trail_stop = current_price - trail_distance
+                    return current_price <= trail_stop
+                else:  # SELL
+                    trail_stop = current_price + trail_distance
+                    return current_price >= trail_stop
+        
+        return False
+    
+    def _should_exit_any_profit_if_trend_weak(self, position: Position, current_price: float) -> bool:
+        """Exit with ANY profit if market trend looks weak/dangerous"""
+        try:
+            # Get recent market data to assess trend strength
+            market_data = self._get_recent_prices(position.symbol, 50)
+            if not market_data:
+                return False
+            
+            current_profit = self._calculate_profit_percentage(position, current_price)
+            
+            # Assess trend strength
+            trend_strength = self._analyze_trend_strength(market_data)
+            
+            # EXIT CONDITIONS for weak trends with ANY profit:
+            
+            # 1. Very weak trend (below 0.2) with any profit above 0.1%
+            if trend_strength < 0.2 and current_profit > 0.1:
+                self.logger.info(f"Very weak trend ({trend_strength:.2f}) with profit ({current_profit:.2f}%) - EXITING")
+                return True
+            
+            # 2. Declining trend momentum with any profit
+            momentum = self._calculate_trend_momentum(market_data)
+            if momentum < -0.3 and current_profit > 0.15:
+                self.logger.info(f"Negative momentum ({momentum:.2f}) with profit ({current_profit:.2f}%) - EXITING")
+                return True
+            
+            # 3. Volatility spike indicating potential reversal
+            volatility = self._calculate_volatility(market_data)
+            if volatility > 0.8 and current_profit > 0.2:
+                self.logger.info(f"High volatility ({volatility:.2f}) with profit ({current_profit:.2f}%) - EXITING")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"Error in trend analysis: {e}")
+            return False
+    
+    def _should_take_profit_by_time(self, profit_pct: float, time_open: float) -> bool:
+        """Take profit based on time - MORE AGGRESSIVE thresholds"""
+        # AGGRESSIVE time-based profit taking
+        
+        if time_open > 8:  # 8+ hours
+            if profit_pct > 0.1:  # ANY profit after 8 hours
+                return True
+        elif time_open > 4:  # 4+ hours
+            if profit_pct > 0.3:  # Small profit after 4 hours
+                return True
+        elif time_open > 2:  # 2+ hours
+            if profit_pct > 0.5:  # Decent profit after 2 hours
+                return True
+        elif time_open > 1:  # 1+ hour
+            if profit_pct > 0.8:  # Good profit after 1 hour
+                return True
+        
+        return False
+    
+    def _should_exit_profit_stagnation_aggressive(self, position: Position, current_price: float) -> bool:
+        """AGGRESSIVE profit stagnation - exit much earlier"""
+        try:
+            # Get recent price history for this symbol
+            market_data = self._get_recent_prices(position.symbol, 100)
+            if not market_data:
+                return False
+            
+            # Find the peak profit achieved
+            peak_profit = 0.0
+            for price_data in market_data:
+                price = price_data['close']
+                if position.action == 'BUY':
+                    profit = (price - position.entry_price) / position.entry_price * 100
+                else:  # SELL
+                    profit = (position.entry_price - price) / position.entry_price * 100
+                
+                if profit > peak_profit:
+                    peak_profit = profit
+            
+            # Current profit
+            current_profit = self._calculate_profit_percentage(position, current_price)
+            
+            # AGGRESSIVE: Exit if we've given back more than 40% of peak profit (was 60%)
+            profit_reduction = peak_profit - current_profit
+            if peak_profit > 0.5 and profit_reduction > peak_profit * 0.4:
+                self.logger.info(f"AGGRESSIVE profit stagnation: Peak {peak_profit:.2f}%, Current {current_profit:.2f}% - EXITING")
+                return True
+            
+            # EVEN MORE AGGRESSIVE: If we've hit a good profit (>1%) and given back 25%
+            if peak_profit > 1.0 and profit_reduction > peak_profit * 0.25:
+                self.logger.info(f"VERY AGGRESSIVE profit protection: Peak {peak_profit:.2f}%, Current {current_profit:.2f}% - EXITING")
+                return True
+            
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"Error in aggressive profit stagnation check: {e}")
+            return False
+    
+    def _calculate_trend_momentum(self, market_data: List[Dict]) -> float:
+        """Calculate trend momentum (positive = gaining strength, negative = losing strength)"""
+        if len(market_data) < 10:
+            return 0.0
+        
+        # Compare recent price movement vs earlier movement
+        recent_prices = [d['close'] for d in market_data[-10:]]
+        earlier_prices = [d['close'] for d in market_data[-20:-10]]
+        
+        recent_change = (recent_prices[-1] - recent_prices[0]) / recent_prices[0]
+        earlier_change = (earlier_prices[-1] - earlier_prices[0]) / earlier_prices[0]
+        
+        return recent_change - earlier_change
+    
+    def _calculate_volatility(self, market_data: List[Dict]) -> float:
+        """Calculate volatility (higher = more unstable)"""
+        if len(market_data) < 10:
+            return 0.0
+        
+        prices = [d['close'] for d in market_data[-20:]]
+        returns = [(prices[i] - prices[i-1]) / prices[i-1] for i in range(1, len(prices))]
+        
+        # Calculate standard deviation of returns
+        mean_return = sum(returns) / len(returns)
+        variance = sum((r - mean_return) ** 2 for r in returns) / len(returns)
+        
+        return variance ** 0.5  # Standard deviation
+
     def _should_exit_market_reversal(self, position: Position, current_price: float) -> bool:
         """Exit based on market reversal signals"""
         try:
@@ -725,20 +1007,34 @@ class TradingEngine:
             return False
     
     def _should_take_partial_profit(self, position: Position, current_price: float) -> bool:
-        """Take partial profits at certain levels"""
+        """CONSERVATIVE partial profit taking - only for account growth"""
         current_profit = self._calculate_profit_percentage(position, current_price)
         time_open = (datetime.now() - position.open_time).total_seconds() / 3600
         
-        # Take partial profit at 0.8% if trade has been open for over 2 hours
-        if current_profit >= 0.8 and time_open > 2:
-            # Close 50% of position
-            self._partial_close_position(position, 0.5)
+        # CONSERVATIVE: Only take partial profits at much higher levels for account growth
+        
+        # Level 1: Take 25% at 1.5% profit (let it run more)
+        if current_profit >= 1.5:
+            self._partial_close_position(position, 0.25)
+            self.logger.info(f"Conservative partial profit: 25% taken at {current_profit:.2f}% profit")
             return True
         
-        # Take partial profit at 1.2% regardless of time
-        if current_profit >= 1.2:
-            # Close 30% of position
+        # Level 2: Take 30% at 2.0% profit 
+        if current_profit >= 2.0:
             self._partial_close_position(position, 0.3)
+            self.logger.info(f"Partial profit: 30% taken at {current_profit:.2f}% profit")
+            return True
+        
+        # Level 3: Take 40% at 2.5% profit 
+        if current_profit >= 2.5:
+            self._partial_close_position(position, 0.4)
+            self.logger.info(f"Partial profit: 40% taken at {current_profit:.2f}% profit")
+            return True
+        
+        # Level 4: Take remaining at 3.0% profit (let it run even more)
+        if current_profit >= 3.0:
+            self._partial_close_position(position, 1.0)  # Close remaining position
+            self.logger.info(f"Final profit: Position closed at {current_profit:.2f}% profit")
             return True
         
         return False

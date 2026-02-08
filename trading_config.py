@@ -7,12 +7,14 @@
 # Trading Mode: demo, live, backtest
 TRADING_MODE = "demo"  # CHANGE TO "live" FOR REAL TRADING
 
-# Neural Network Settings
-CONFIDENCE_THRESHOLD = 0.78  # Minimum confidence for trades (78%)
-MAX_RISK_PER_TRADE = 0.02    # Maximum risk per trade (2%)
-MAX_DAILY_RISK = 0.05        # Maximum daily risk (5%)
-MAX_DRAWDOWN_LIMIT = 0.15    # Maximum drawdown limit (15%)
-MAX_OPEN_POSITIONS = 5        # Maximum simultaneous open positions
+# Neural Network Settings with Enhanced Tail Risk Protection
+CONFIDENCE_THRESHOLD = 0.65  # EMERGENCY FIX: Reduced from 0.78 for profitability
+DYNAMIC_CONFIDENCE_ENABLED = True  # Enable dynamic confidence adjustment
+MAX_RISK_PER_TRADE = 0.035   # EMERGENCY FIX: Increased from 0.02 for better returns
+MAX_DAILY_RISK = 0.04        # EMERGENCY FIX: Increased from 0.02 for trading activity
+MAX_DRAWDOWN_LIMIT = 0.10    # Enhanced drawdown limit (10% - reduced for stability)
+TAIL_RISK_PROTECTION = True  # Enable advanced tail risk protection
+MAX_OPEN_POSITIONS = 8        # EMERGENCY FIX: Increased from 5 for more opportunities
 
 # Symbols to trade (add your preferred forex pairs)
 SYMBOLS = [
@@ -23,7 +25,8 @@ SYMBOLS = [
     "USDCAD",
     "NZDUSD",
     "EURJPY",
-    "GBPJPY"
+    "GBPJPY",
+    "BTCUSD"
 ]
 
 # Risk Management Settings

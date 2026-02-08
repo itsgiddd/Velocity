@@ -383,19 +383,20 @@ class NeuralRetrainingPipeline:
                 # Calculate sample weights
                 weights = self.label_generator.calculate_label_weights(primary_labels)
                 
-                # Create sequences for training
-                min_length = min(len(h1_norm), len(h4_norm), len(d1_norm))
-                sequence_length = min(
-                    self.config.sequence_length_h1,
-                    min_length - self.config.sequence_length_h4 - self.config.sequence_length_d1 - 1
+                # Create aligned sequences for training across all timeframes.
+                max_start = min(
+                    len(h1_norm) - self.config.sequence_length_h1 - 1,
+                    len(h4_norm) - self.config.sequence_length_h4 - 1,
+                    len(d1_norm) - self.config.sequence_length_d1 - 1,
+                    len(primary_labels) - self.config.sequence_length_h1 - 1,
                 )
-                
-                if sequence_length < 10:  # Minimum sequence length
-                    logger.warning(f"Insufficient sequence length for {symbol}: {sequence_length}")
+
+                if max_start < 10:  # Minimum number of windows
+                    logger.warning(f"Insufficient sequence windows for {symbol}: {max_start}")
                     continue
                 
                 # Extract sequences
-                for i in range(sequence_length):
+                for i in range(max_start):
                     start_idx = i
                     end_idx_h1 = i + self.config.sequence_length_h1
                     end_idx_h4 = i + self.config.sequence_length_h4
@@ -417,8 +418,9 @@ class NeuralRetrainingPipeline:
                         all_features['sentiment'].append(torch.zeros(10))  # Placeholder sentiment
                         
                         # Add labels and weights
-                        all_labels.append(primary_labels[end_idx_h1])
-                        all_weights.append(weights[end_idx_h1])
+                        label_idx = end_idx_h1
+                        all_labels.append(primary_labels[label_idx])
+                        all_weights.append(weights[label_idx])
                         
                         # Add metadata
                         metadata['symbols'].append(symbol)
@@ -502,7 +504,10 @@ class NeuralRetrainingPipeline:
         ).to(self.device)
         
         # Loss function and optimizer
-        criterion = nn.CrossEntropyLoss(weight=training_data.weights.to(self.device))
+        class_counts = torch.bincount(training_data.labels, minlength=3).float()
+        class_weights = class_counts.sum() / (class_counts + 1e-8)
+        class_weights = class_weights / class_weights.mean()
+        criterion = nn.CrossEntropyLoss(weight=class_weights.to(self.device))
         optimizer = optim.Adam(model.parameters(), lr=self.config.learning_rate)
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=5, factor=0.5)
         

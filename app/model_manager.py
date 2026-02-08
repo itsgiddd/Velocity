@@ -22,6 +22,7 @@ import pandas as pd
 import pickle
 import logging
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
@@ -46,6 +47,87 @@ class SimpleNeuralNetwork(nn.Module):
     def forward(self, x):
         return self.network(x)
 
+class ProfitOptimizedNetwork(nn.Module):
+    """Fallback class used to unpickle legacy profit-optimized PKL models."""
+
+    def __init__(self, input_size: int = 80, hidden_size: int = 256, num_classes: int = 3):
+        super(ProfitOptimizedNetwork, self).__init__()
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.LeakyReLU(0.1),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_size, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.LeakyReLU(0.1),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.BatchNorm1d(hidden_size // 2),
+            nn.LeakyReLU(0.1),
+            nn.Dropout(0.2),
+        )
+        self.direction_head = nn.Sequential(
+            nn.Linear(hidden_size // 2, 64),
+            nn.LeakyReLU(0.1),
+            nn.Linear(64, num_classes),
+        )
+        self.confidence_head = nn.Sequential(
+            nn.Linear(hidden_size // 2, 32),
+            nn.LeakyReLU(0.1),
+            nn.Linear(32, 1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        features = self.feature_extractor(x)
+        return self.direction_head(features), self.confidence_head(features)
+
+class ScalpingNeuralNetwork(nn.Module):
+    """Fallback class used to unpickle legacy scalping PKL models."""
+
+    def __init__(self, input_size: int = 80, hidden_size: int = 128, num_classes: int = 3):
+        super(ScalpingNeuralNetwork, self).__init__()
+        self.network = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_size // 2, hidden_size // 4),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size // 4, num_classes),
+            nn.Softmax(dim=1),
+        )
+
+    def forward(self, x):
+        return self.network(x)
+
+class LegacyFeatureEngine:
+    """Placeholder class for unpickling serialized feature engines."""
+    pass
+
+class LegacyModelUnpickler(pickle.Unpickler):
+    """Custom unpickler that remaps legacy __main__ class names."""
+
+    CLASS_MAP = {
+        ("__main__", "ProfitOptimizedNetwork"): ProfitOptimizedNetwork,
+        ("__main__", "ScalpingNeuralNetwork"): ScalpingNeuralNetwork,
+        ("__main__", "ProfitFeatureEngine"): LegacyFeatureEngine,
+        ("__main__", "ScalpingFeatureEngine"): LegacyFeatureEngine,
+        ("profit_optimized_trainer", "ProfitOptimizedNetwork"): ProfitOptimizedNetwork,
+        ("pkl_neural_model_trainer", "ScalpingNeuralNetwork"): ScalpingNeuralNetwork,
+        ("profit_optimized_trainer", "ProfitFeatureEngine"): LegacyFeatureEngine,
+        ("pkl_neural_model_trainer", "ScalpingFeatureEngine"): LegacyFeatureEngine,
+    }
+
+    def find_class(self, module, name):
+        mapped_class = self.CLASS_MAP.get((module, name))
+        if mapped_class is not None:
+            return mapped_class
+        return super().find_class(module, name)
+
 class NeuralModelManager:
     """Professional neural model manager"""
     
@@ -62,12 +144,286 @@ class NeuralModelManager:
         # Training data cache
         self.training_data = None
         self.feature_dim = 6  # Default feature dimension
+        self.feature_mean: Optional[np.ndarray] = None
+        self.feature_std: Optional[np.ndarray] = None
+        self.symbol_to_index: Dict[str, int] = {}
+        self.class_labels: List[str] = ["SELL", "HOLD", "BUY"]
+        self.default_trade_threshold = 0.60
         
         # Performance tracking
         self.performance_history = []
         
         # Thread safety
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _normalize_symbol(symbol: Optional[str]) -> str:
+        """Normalize symbol keys for robust metadata lookup."""
+        if symbol is None:
+            return ""
+        return re.sub(r"[^A-Z0-9]", "", str(symbol).upper())
+
+    def _get_symbol_aliases(self, symbol: Optional[str]) -> List[str]:
+        """Build symbol aliases (e.g., BTCUSD -> BTC) for threshold/index matching."""
+        normalized = self._normalize_symbol(symbol)
+        aliases = []
+        if normalized:
+            aliases.append(normalized)
+            if normalized.endswith("USD") and len(normalized) > 3:
+                aliases.append(normalized[:-3])
+        return aliases
+
+    def _coerce_feature_vector(self, features: np.ndarray) -> np.ndarray:
+        """
+        Return a 1D float feature vector compatible with current model input size.
+        Pads/truncates to keep runtime robust when model/input dimensions differ.
+        """
+        vector = np.asarray(features, dtype=np.float32).reshape(-1)
+        if len(vector) < self.feature_dim:
+            vector = np.pad(vector, (0, self.feature_dim - len(vector)), mode='constant')
+        elif len(vector) > self.feature_dim:
+            vector = vector[:self.feature_dim]
+        return vector
+
+    def _resolve_symbol_index(self, symbol: Optional[str]) -> Optional[int]:
+        """Resolve symbol to known index using aliases."""
+        if not self.symbol_to_index:
+            return None
+        for alias in self._get_symbol_aliases(symbol):
+            if alias in self.symbol_to_index:
+                return self.symbol_to_index[alias]
+        return None
+
+    def get_symbol_features(self, symbol: Optional[str]) -> np.ndarray:
+        """
+        Return one-hot symbol features for model input extension.
+        If no symbol map is present, returns an empty vector.
+        """
+        if not self.symbol_to_index:
+            return np.array([], dtype=np.float32)
+        vector = np.zeros(len(self.symbol_to_index), dtype=np.float32)
+        idx = self._resolve_symbol_index(symbol)
+        if idx is not None and 0 <= idx < len(vector):
+            vector[idx] = 1.0
+        return vector
+
+    def _resolve_trade_threshold(self, symbol: Optional[str]) -> float:
+        """Resolve per-symbol threshold with global fallback."""
+        thresholds = self.model_metadata.get('symbol_thresholds', {}) if isinstance(self.model_metadata, dict) else {}
+        if isinstance(thresholds, dict):
+            for alias in self._get_symbol_aliases(symbol):
+                value = thresholds.get(alias)
+                if value is not None:
+                    try:
+                        return float(value)
+                    except Exception:
+                        pass
+        try:
+            return float(self.model_metadata.get('global_trade_threshold', self.default_trade_threshold))
+        except Exception:
+            return self.default_trade_threshold
+
+    def _resolve_action_mode(self, symbol: Optional[str]) -> str:
+        """Resolve per-symbol action mode (`normal` or `invert`) with safe fallback."""
+        modes = self.model_metadata.get('symbol_action_modes', {}) if isinstance(self.model_metadata, dict) else {}
+        if isinstance(modes, dict):
+            for alias in self._get_symbol_aliases(symbol):
+                value = modes.get(alias)
+                if value is None:
+                    continue
+                mode = str(value).strip().lower()
+                if mode in ("normal", "invert"):
+                    return mode
+        return "normal"
+
+    @staticmethod
+    def _normalize_class_labels(raw_labels: Any, fallback: List[str]) -> List[str]:
+        """Normalize class order into BUY/SELL/HOLD labels when available."""
+        labels: List[str] = []
+        if isinstance(raw_labels, dict):
+            ordered_items = sorted(raw_labels.items(), key=lambda item: str(item[0]))
+            labels = [str(value).strip().upper() for _, value in ordered_items]
+        elif isinstance(raw_labels, (list, tuple)):
+            labels = [str(value).strip().upper() for value in raw_labels]
+
+        normalized: List[str] = []
+        for label in labels[:3]:
+            if label in ("BUY", "LONG"):
+                normalized.append("BUY")
+            elif label in ("SELL", "SHORT"):
+                normalized.append("SELL")
+            elif label in ("HOLD", "FLAT", "NONE"):
+                normalized.append("HOLD")
+            else:
+                return fallback
+
+        if len(normalized) == 3 and set(normalized) == {"BUY", "SELL", "HOLD"}:
+            return normalized
+        return fallback
+
+    @staticmethod
+    def _infer_feature_dim(model: nn.Module, fallback: int) -> int:
+        """Infer model input width from the first linear layer when possible."""
+        try:
+            for layer in model.modules():
+                if isinstance(layer, nn.Linear):
+                    return int(layer.in_features)
+        except Exception:
+            pass
+        return fallback
+
+    @staticmethod
+    def _load_pickle_payload(model_path: Path) -> Any:
+        with model_path.open("rb") as model_file:
+            return LegacyModelUnpickler(model_file).load()
+
+    def _load_torch_checkpoint(self, checkpoint: Any) -> None:
+        """Apply a torch checkpoint (.pth/.pt) to manager state."""
+        metadata = checkpoint.get('metadata', {}) if isinstance(checkpoint, dict) else {}
+        loaded_feature_dim = (
+            checkpoint.get('feature_dim')
+            if isinstance(checkpoint, dict)
+            else None
+        )
+        if loaded_feature_dim is None and isinstance(metadata, dict):
+            loaded_feature_dim = metadata.get('feature_dim')
+        if loaded_feature_dim is not None:
+            self.feature_dim = int(loaded_feature_dim)
+
+        self.current_model = SimpleNeuralNetwork(input_dim=self.feature_dim)
+
+        if isinstance(checkpoint, dict) and 'model_state_dict' in checkpoint:
+            self.current_model.load_state_dict(checkpoint['model_state_dict'])
+        elif isinstance(checkpoint, dict):
+            self.current_model.load_state_dict(checkpoint)
+        else:
+            raise ValueError("Unsupported checkpoint format")
+
+        self.current_model.eval()
+
+        if isinstance(checkpoint, dict) and 'metadata' in checkpoint:
+            self.model_metadata = checkpoint['metadata']
+        elif isinstance(checkpoint, dict) and 'training_date' in checkpoint:
+            self.model_metadata = {
+                'training_date': checkpoint['training_date'],
+                'accuracy': checkpoint.get('accuracy', 'Unknown'),
+                'win_rate': checkpoint.get('win_rate', 'Unknown')
+            }
+        else:
+            self.model_metadata = {
+                'training_date': 'Unknown',
+                'accuracy': 'Unknown',
+                'win_rate': 'Unknown'
+            }
+        if not isinstance(self.model_metadata, dict):
+            self.model_metadata = {}
+
+        loaded_symbol_index = None
+        if isinstance(checkpoint, dict):
+            loaded_symbol_index = checkpoint.get('symbol_to_index')
+        if loaded_symbol_index is None and isinstance(self.model_metadata, dict):
+            loaded_symbol_index = self.model_metadata.get('symbol_to_index')
+
+        self.symbol_to_index = {}
+        if isinstance(loaded_symbol_index, dict):
+            normalized_items = [
+                (self._normalize_symbol(k), int(v))
+                for k, v in loaded_symbol_index.items()
+                if self._normalize_symbol(k)
+            ]
+            normalized_items.sort(key=lambda item: item[1])
+            for new_idx, (key, _) in enumerate(normalized_items):
+                self.symbol_to_index[key] = new_idx
+
+        loaded_mean = None
+        loaded_std = None
+        if isinstance(checkpoint, dict):
+            loaded_mean = checkpoint.get('feature_mean')
+            loaded_std = checkpoint.get('feature_std')
+        if loaded_mean is None and isinstance(self.model_metadata, dict):
+            loaded_mean = self.model_metadata.get('feature_mean')
+        if loaded_std is None and isinstance(self.model_metadata, dict):
+            loaded_std = self.model_metadata.get('feature_std')
+
+        self.feature_mean = None
+        self.feature_std = None
+        if loaded_mean is not None and loaded_std is not None:
+            mean_arr = np.asarray(loaded_mean, dtype=np.float32).reshape(-1)
+            std_arr = np.asarray(loaded_std, dtype=np.float32).reshape(-1)
+            if len(mean_arr) == self.feature_dim and len(std_arr) == self.feature_dim:
+                std_arr = np.where(np.abs(std_arr) < 1e-8, 1.0, std_arr)
+                self.feature_mean = mean_arr
+                self.feature_std = std_arr
+
+        if isinstance(self.model_metadata, dict):
+            global_threshold = self.model_metadata.get('global_trade_threshold')
+            if global_threshold is not None:
+                try:
+                    self.default_trade_threshold = float(global_threshold)
+                except Exception:
+                    pass
+
+        class_labels = None
+        if isinstance(checkpoint, dict):
+            class_labels = checkpoint.get("class_labels") or checkpoint.get("label_names")
+        if class_labels is None and isinstance(self.model_metadata, dict):
+            class_labels = self.model_metadata.get("class_labels") or self.model_metadata.get("label_names")
+        self.class_labels = self._normalize_class_labels(
+            class_labels, fallback=["SELL", "HOLD", "BUY"]
+        )
+
+    def _load_pickle_checkpoint(self, payload: Any, model_path: Path) -> None:
+        """Apply a serialized pickle model package to manager state."""
+        model_obj = None
+        metadata: Dict[str, Any] = {}
+        feature_dim = self.feature_dim
+        class_labels = None
+
+        if isinstance(payload, dict):
+            model_obj = payload.get("neural_network") or payload.get("model") or payload.get("network")
+            existing_metadata = payload.get("metadata")
+            if isinstance(existing_metadata, dict):
+                metadata.update(existing_metadata)
+
+            for field in ("training_date", "model_version", "model_class", "num_classes", "training_symbols"):
+                if field in payload and field not in metadata:
+                    metadata[field] = payload.get(field)
+
+            input_size = payload.get("input_size") or payload.get("feature_dim") or payload.get("input_dim")
+            if input_size is not None:
+                try:
+                    feature_dim = int(input_size)
+                except Exception:
+                    pass
+
+            feature_names = payload.get("feature_names")
+            if isinstance(feature_names, list):
+                metadata.setdefault("feature_count", len(feature_names))
+
+            class_labels = payload.get("class_labels") or payload.get("label_names")
+        else:
+            model_obj = payload
+
+        if not isinstance(model_obj, nn.Module):
+            raise ValueError("PKL file does not contain a supported neural network object")
+
+        self.current_model = model_obj
+        self.current_model.eval()
+
+        self.feature_dim = self._infer_feature_dim(self.current_model, fallback=feature_dim)
+        self.feature_mean = None
+        self.feature_std = None
+        self.symbol_to_index = {}
+
+        metadata.setdefault("source_format", "pickle")
+        metadata.setdefault("model_file", str(model_path))
+        metadata.setdefault("feature_dim", self.feature_dim)
+        self.model_metadata = metadata
+
+        self.class_labels = self._normalize_class_labels(
+            class_labels or self.model_metadata.get("class_labels"),
+            fallback=["BUY", "SELL", "HOLD"],
+        )
     
     def load_model(self, model_path: str = None) -> bool:
         """
@@ -82,54 +438,38 @@ class NeuralModelManager:
         with self._lock:
             try:
                 if model_path is None:
-                    # Look for default model file
+                    app_root = Path(__file__).resolve().parent.parent
                     default_paths = [
+                        app_root / "ultimate_neural_model.pkl",
+                        "ultimate_neural_model.pkl",
                         "neural_model.pth",
                         "models/best_model.pth",
-                        "models/current_model.pth"
+                        "models/current_model.pth",
                     ]
                     
                     model_path = None
                     for path in default_paths:
-                        if Path(path).exists():
-                            model_path = path
+                        candidate = Path(path)
+                        if candidate.exists():
+                            model_path = str(candidate)
                             break
                     
                     if model_path is None:
                         self.logger.error("No model file found")
                         return False
                 
-                self.logger.info(f"Loading neural model from {model_path}")
-                
-                # Load checkpoint
-                checkpoint = torch.load(model_path, map_location='cpu')
-                
-                # Create model instance
-                self.current_model = SimpleNeuralNetwork(input_dim=self.feature_dim)
-                
-                # Load weights
-                if 'model_state_dict' in checkpoint:
-                    self.current_model.load_state_dict(checkpoint['model_state_dict'])
+                model_file = Path(model_path)
+                if not model_file.exists():
+                    raise FileNotFoundError(f"Model file not found: {model_file}")
+
+                self.logger.info(f"Loading neural model from {model_file}")
+
+                if model_file.suffix.lower() == ".pkl":
+                    payload = self._load_pickle_payload(model_file)
+                    self._load_pickle_checkpoint(payload, model_file)
                 else:
-                    self.current_model.load_state_dict(checkpoint)
-                
-                self.current_model.eval()
-                
-                # Load metadata
-                if 'metadata' in checkpoint:
-                    self.model_metadata = checkpoint['metadata']
-                elif 'training_date' in checkpoint:
-                    self.model_metadata = {
-                        'training_date': checkpoint['training_date'],
-                        'accuracy': checkpoint.get('accuracy', 'Unknown'),
-                        'win_rate': checkpoint.get('win_rate', 'Unknown')
-                    }
-                else:
-                    self.model_metadata = {
-                        'training_date': 'Unknown',
-                        'accuracy': 'Unknown',
-                        'win_rate': 'Unknown'
-                    }
+                    checkpoint = torch.load(model_file, map_location='cpu', weights_only=False)
+                    self._load_torch_checkpoint(checkpoint)
                 
                 self.model_loaded = True
                 
@@ -142,6 +482,7 @@ class NeuralModelManager:
                 self.logger.error(f"Error loading model: {e}")
                 self.current_model = None
                 self.model_loaded = False
+                self.class_labels = ["SELL", "HOLD", "BUY"]
                 return False
     
     def save_model(self, model_path: str, metadata: Dict[str, Any] = None) -> bool:
@@ -168,6 +509,12 @@ class NeuralModelManager:
                     'metadata': metadata or self.model_metadata,
                     'save_date': datetime.now().isoformat()
                 }
+
+                if self.symbol_to_index:
+                    save_data['symbol_to_index'] = self.symbol_to_index.copy()
+                if self.feature_mean is not None and self.feature_std is not None:
+                    save_data['feature_mean'] = self.feature_mean.tolist()
+                    save_data['feature_std'] = self.feature_std.tolist()
                 
                 # Ensure directory exists
                 Path(model_path).parent.mkdir(parents=True, exist_ok=True)
@@ -206,6 +553,8 @@ class NeuralModelManager:
             "total_parameters": total_params,
             "trainable_parameters": trainable_params,
             "model_size_mb": self._estimate_model_size(),
+            "symbol_features": len(self.symbol_to_index),
+            "has_feature_scaler": self.feature_mean is not None and self.feature_std is not None,
             "metadata": self.model_metadata,
             "performance_history": self.performance_history[-10:] if self.performance_history else []
         }
@@ -228,12 +577,13 @@ class NeuralModelManager:
         total_size = param_size + buffer_size
         return total_size / (1024 * 1024)  # Convert to MB
     
-    def predict(self, features: np.ndarray) -> Optional[Dict[str, Any]]:
+    def predict(self, features: np.ndarray, symbol: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Make prediction using loaded model
         
         Args:
             features: Input features array
+            symbol: Optional symbol for per-symbol threshold resolution
             
         Returns:
             Dict containing prediction results or None
@@ -244,34 +594,93 @@ class NeuralModelManager:
         
         try:
             with torch.no_grad():
-                # Ensure features are correct shape
-                if features.ndim == 1:
-                    features = features.reshape(1, -1)
-                
-                # Convert to tensor
-                X = torch.FloatTensor(features)
+                vector = self._coerce_feature_vector(features)
+
+                # Apply optional scaler from training metadata.
+                if self.feature_mean is not None and self.feature_std is not None:
+                    vector = (vector - self.feature_mean) / (self.feature_std + 1e-8)
+
+                # Convert to tensor with expected batch shape.
+                X = torch.FloatTensor(vector.reshape(1, -1))
                 
                 # Make prediction
-                outputs = self.current_model(X)
+                model_outputs = self.current_model(X)
+                output_logits = model_outputs
+                confidence_head_value: Optional[float] = None
+                if isinstance(model_outputs, (tuple, list)):
+                    output_logits = model_outputs[0]
+                    if len(model_outputs) > 1:
+                        raw_confidence = model_outputs[1]
+                        try:
+                            conf_array = raw_confidence.detach().cpu().numpy().reshape(-1)
+                            if len(conf_array) > 0:
+                                confidence_head_value = float(np.clip(conf_array[0], 0.0, 1.0))
+                        except Exception:
+                            confidence_head_value = None
+
+                if not torch.is_tensor(output_logits):
+                    raise ValueError("Model output is not a tensor")
+                if output_logits.ndim == 1:
+                    output_logits = output_logits.reshape(1, -1)
                 
                 # Get probabilities
-                probabilities = torch.softmax(outputs, dim=1).numpy()[0]
-                predicted_class = torch.argmax(outputs, dim=1).item()
+                probabilities = torch.softmax(output_logits, dim=1).detach().cpu().numpy()[0]
+                predicted_class = int(torch.argmax(output_logits, dim=1).item())
                 
                 # Map classes
-                classes = ['SELL', 'HOLD', 'BUY']
-                predicted_action = classes[predicted_class]
-                confidence = probabilities[predicted_class]
+                classes = self.class_labels if len(self.class_labels) == 3 else ['SELL', 'HOLD', 'BUY']
+                if predicted_class >= len(classes):
+                    predicted_action = 'HOLD'
+                    confidence = float(np.max(probabilities))
+                else:
+                    predicted_action = classes[predicted_class]
+                    confidence = float(probabilities[predicted_class])
+                if confidence_head_value is not None:
+                    confidence = max(confidence, confidence_head_value)
+
+                probability_map: Dict[str, float] = {'SELL': 0.0, 'HOLD': 0.0, 'BUY': 0.0}
+                for idx, class_name in enumerate(classes):
+                    if idx < len(probabilities):
+                        normalized_name = str(class_name).strip().upper()
+                        if normalized_name in probability_map:
+                            probability_map[normalized_name] = float(probabilities[idx])
+
+                directional_probs = {
+                    'SELL': probability_map['SELL'],
+                    'BUY': probability_map['BUY']
+                }
+                directional_action = 'BUY' if directional_probs['BUY'] >= directional_probs['SELL'] else 'SELL'
+                action_mode = self._resolve_action_mode(symbol)
+                if action_mode == 'invert':
+                    if predicted_action == 'BUY':
+                        predicted_action = 'SELL'
+                    elif predicted_action == 'SELL':
+                        predicted_action = 'BUY'
+                    directional_action = 'SELL' if directional_action == 'BUY' else 'BUY'
+
+                trade_score = directional_probs.get(directional_action, 0.0)
+                threshold = self._resolve_trade_threshold(symbol)
+                should_trade = (
+                    predicted_action in ('BUY', 'SELL')
+                    and confidence >= threshold
+                )
                 
                 return {
                     'action': predicted_action,
                     'confidence': confidence,
                     'probabilities': {
-                        'SELL': float(probabilities[0]),
-                        'HOLD': float(probabilities[1]),
-                        'BUY': float(probabilities[2])
+                        'SELL': probability_map['SELL'],
+                        'HOLD': probability_map['HOLD'],
+                        'BUY': probability_map['BUY']
                     },
-                    'raw_outputs': outputs.numpy().tolist()
+                    'directional_action': directional_action,
+                    'trade_score': float(trade_score),
+                    'trade_threshold': float(threshold),
+                    'should_trade': bool(should_trade),
+                    'action_mode': action_mode,
+                    'class_labels': classes,
+                    'confidence_head': confidence_head_value,
+                    'raw_outputs': output_logits.detach().cpu().numpy().tolist()
                 }
                 
         except Exception as e:
@@ -360,6 +769,9 @@ class NeuralModelManager:
             
             # Update feature dimension
             self.feature_dim = features.shape[1] if len(features.shape) > 1 else 1
+            self.feature_mean = None
+            self.feature_std = None
+            self.symbol_to_index = {}
             
             # Create new model
             self.current_model = SimpleNeuralNetwork(input_dim=self.feature_dim)
@@ -396,7 +808,8 @@ class NeuralModelManager:
                 'learning_rate': learning_rate,
                 'training_accuracy': accuracy,
                 'feature_dimension': self.feature_dim,
-                'training_samples': len(features)
+                'training_samples': len(features),
+                'global_trade_threshold': self.default_trade_threshold
             }
             
             self.model_loaded = True
@@ -417,8 +830,8 @@ class NeuralModelManager:
         """
         models = []
         
-        # Look for .pth files in models directory
-        for model_file in self.models_dir.glob("*.pth"):
+        model_files = list(self.models_dir.glob("*.pth")) + list(self.models_dir.glob("*.pkl"))
+        for model_file in model_files:
             try:
                 # Get file stats
                 stat = model_file.stat()
@@ -426,11 +839,22 @@ class NeuralModelManager:
                 # Try to load metadata
                 metadata = {}
                 try:
-                    checkpoint = torch.load(model_file, map_location='cpu')
-                    if 'metadata' in checkpoint:
-                        metadata = checkpoint['metadata']
-                    elif 'training_date' in checkpoint:
-                        metadata = {'training_date': checkpoint['training_date']}
+                    if model_file.suffix.lower() == ".pkl":
+                        payload = self._load_pickle_payload(model_file)
+                        if isinstance(payload, dict):
+                            raw_meta = payload.get('metadata')
+                            if isinstance(raw_meta, dict):
+                                metadata.update(raw_meta)
+                            for field in ("training_date", "model_version", "model_class"):
+                                if field in payload and field not in metadata:
+                                    metadata[field] = payload[field]
+                        metadata.setdefault("source_format", "pickle")
+                    else:
+                        checkpoint = torch.load(model_file, map_location='cpu', weights_only=False)
+                        if isinstance(checkpoint, dict) and 'metadata' in checkpoint:
+                            metadata = checkpoint['metadata']
+                        elif isinstance(checkpoint, dict) and 'training_date' in checkpoint:
+                            metadata = {'training_date': checkpoint['training_date']}
                 except:
                     pass
                 

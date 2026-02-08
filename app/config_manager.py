@@ -119,6 +119,9 @@ class ConfigManager:
                         'NZDUSD': {'enabled': False, 'max_risk': 1.5},
                         'EURJPY': {'enabled': False, 'max_risk': 1.5},
                         'GBPJPY': {'enabled': False, 'max_risk': 1.5}
+                    },
+                    'crypto_pairs': {
+                        'BTCUSD': {'enabled': True, 'max_risk': 1.0}
                     }
                 },
                 'neural_network': {

@@ -437,6 +437,17 @@ class LiveNeuralTradingBot:
                     reason=reason,
                     timestamp=datetime.now()
                 )
+
+            return TradeSignal(
+                symbol=market_data.symbol,
+                action=action,
+                confidence=confidence,
+                lot_size=max(0.01, float(lot_size) if lot_size else 0.01),
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                reason=reason,
+                timestamp=datetime.now()
+            )
             
         except Exception as e:
             logger.error(f"Error generating neural signal: {e}")
@@ -489,78 +500,19 @@ class LiveNeuralTradingBot:
             logger.info(f"  H1: {h1_bullish} (MA5={h1_ma5:.5f}, MA10={h1_ma10:.5f})")
             logger.info(f"  H4: {h4_bullish} (MA5={h4_ma5:.5f}, MA10={h4_ma10:.5f})")
             
-            # Calculate confidence based on timeframe agreement
-            timeframe_agreement = sum([m15_bullish, h1_bullish, h4_bullish])
-            
-            if timeframe_agreement >= 2:  # At least 2 timeframes agree
-                if m15_bullish and h1_bullish and h4_bullish:
-                    # Strong bullish agreement - 3/3 timeframes
-                    confidence = 0.90
-                    action = TradeResult.BUY
-                    reason = f"Strong bullish (3/3 timeframes)"
-                elif not m15_bullish and not h1_bullish and not h4_bullish:
-                    # Strong bearish agreement - 3/3 timeframes
-                    confidence = 0.90
-                    action = TradeResult.SELL
-                    reason = f"Strong bearish (3/3 timeframes)"
-                else:
-                    # 2/3 timeframes agree - BOOSTED confidence
-                    confidence = 0.80  # Boosted to pass threshold
-                    if m15_bullish or h1_bullish or h4_bullish:
-                        action = TradeResult.BUY
-                        reason = f"Bullish (2/3 timeframes)"
-                    else:
-                        action = TradeResult.SELL
-                        reason = f"Bearish (2/3 timeframes)"
-                
-                # Calculate stop loss and take profit for 2/3 and 3/3 cases
-                if action == TradeResult.BUY:
-                    stop_loss = market_data.bid - (market_data.spread * 3)
-                    take_profit = market_data.ask + (market_data.spread * 6)
-                else:
-                    stop_loss = market_data.ask + (market_data.spread * 3)
-                    take_profit = market_data.bid - (market_data.spread * 6)
-                
-                return TradeSignal(
-                    symbol=market_data.symbol,
-                    action=action,
-                    confidence=confidence,
-                    lot_size=0.01,
-                    stop_loss=stop_loss,
-                    take_profit=take_profit,
-                    reason=reason,
-                    timestamp=datetime.now()
-                )
-            elif timeframe_agreement == 1:  # Only 1 timeframe agrees
-                # Trade with lower confidence (65% as requested)
-                confidence = 0.65  # Now passes 65% threshold
-                if m15_bullish or h1_bullish or h4_bullish:
-                    action = TradeResult.BUY
-                    reason = f"Bullish (1/3 timeframes) - lower confidence"
-                else:
-                    action = TradeResult.SELL
-                    reason = f"Bearish (1/3 timeframes) - lower confidence"
-                
-                # Calculate stop loss and take profit
-                if action == TradeResult.BUY:
-                    stop_loss = market_data.bid - (market_data.spread * 3)
-                    take_profit = market_data.ask + (market_data.spread * 6)
-                else:
-                    stop_loss = market_data.ask + (market_data.spread * 3)
-                    take_profit = market_data.bid - (market_data.spread * 6)
-                
-                return TradeSignal(
-                    symbol=market_data.symbol,
-                    action=action,
-                    confidence=confidence,
-                    lot_size=0.01,
-                    stop_loss=stop_loss,
-                    take_profit=take_profit,
-                    reason=reason,
-                    timestamp=datetime.now()
-                )
+            # Determine majority direction (prevents bullish bias bug).
+            bullish_count = int(m15_bullish) + int(h1_bullish) + int(h4_bullish)
+            bearish_count = 3 - bullish_count
+
+            if bullish_count >= 2:
+                action = TradeResult.BUY
+                confidence = 0.90 if bullish_count == 3 else 0.80
+                reason = "Strong bullish (3/3 timeframes)" if bullish_count == 3 else "Bullish majority (2/3 timeframes)"
+            elif bearish_count >= 2:
+                action = TradeResult.SELL
+                confidence = 0.90 if bearish_count == 3 else 0.80
+                reason = "Strong bearish (3/3 timeframes)" if bearish_count == 3 else "Bearish majority (2/3 timeframes)"
             else:
-                # No clear agreement
                 return TradeSignal(
                     symbol=market_data.symbol,
                     action=TradeResult.HOLD,
@@ -571,6 +523,25 @@ class LiveNeuralTradingBot:
                     reason=f"No timeframe agreement (15m: {m15_bullish}, 1h: {h1_bullish}, 4h: {h4_bullish})",
                     timestamp=datetime.now()
                 )
+
+            # Calculate stop loss and take profit
+            if action == TradeResult.BUY:
+                stop_loss = market_data.bid - (market_data.spread * 3)
+                take_profit = market_data.ask + (market_data.spread * 6)
+            else:
+                stop_loss = market_data.ask + (market_data.spread * 3)
+                take_profit = market_data.bid - (market_data.spread * 6)
+
+            return TradeSignal(
+                symbol=market_data.symbol,
+                action=action,
+                confidence=confidence,
+                lot_size=0.01,
+                stop_loss=stop_loss,
+                take_profit=take_profit,
+                reason=reason,
+                timestamp=datetime.now()
+            )
                 
         except Exception as e:
             logger.error(f"Error generating simple signal: {e}")
@@ -647,6 +618,15 @@ class LiveNeuralTradingBot:
             
             # Update performance metrics
             self.performance_metrics['total_trades'] += 1
+            self.trade_history.append({
+                'ticket': result.order,
+                'symbol': signal.symbol,
+                'action': signal.action.value,
+                'lot_size': lot_size,
+                'entry_price': result.price,
+                'confidence': signal.confidence,
+                'timestamp': datetime.now().isoformat()
+            })
             
             return True
             
@@ -865,7 +845,7 @@ class LiveNeuralTradingBot:
             logger.info(f"   Win Rate: {self.performance_metrics['win_rate']:.1%}")
             logger.info(f"   Total Profit: {self.performance_metrics['total_profit']:.2f}")
             pf = self.performance_metrics['profit_factor']
-            pf_display = "∞" if pf > 99 else f"{pf:.2f}"
+            pf_display = "INF" if pf > 99 else f"{pf:.2f}"
             logger.info(f"   Profit Factor: {pf_display}")
             
         except Exception as e:
@@ -874,6 +854,7 @@ class LiveNeuralTradingBot:
     def trading_loop(self):
         """Main trading loop"""
         logger.info("Starting Trading Loop...")
+        cycle_count = 0
         
         while self.is_running:
             try:
@@ -918,7 +899,8 @@ class LiveNeuralTradingBot:
                         continue
                 
                 # Update performance metrics every 10 cycles
-                if len(self.trade_history) % 10 == 0:
+                cycle_count += 1
+                if cycle_count % 10 == 0:
                     self.update_performance_metrics()
                 
                 # Sleep between cycles
@@ -942,6 +924,9 @@ class LiveNeuralTradingBot:
             if not self.connect_to_mt5():
                 logger.error("Failed to connect to MT5")
                 return False
+
+            # Sync after MT5 connection so existing positions are visible immediately.
+            self._sync_positions_with_mt5()
             
             # Set running flag
             self.is_running = True

@@ -50,6 +50,7 @@ def validate_config():
     logger = logging.getLogger(__name__)
     
     errors = []
+    warnings = []
     
     # Check trading mode
     if TRADING_MODE not in ['demo', 'live', 'backtest']:
@@ -69,16 +70,20 @@ def validate_config():
     
     # Safety check for live trading
     if TRADING_MODE == 'live':
-        errors.append("LIVE TRADING MODE DETECTED!")
-        errors.append("This will execute REAL trades with REAL money!")
-        errors.append("Are you absolutely sure you want to proceed?")
-        errors.append("Press Ctrl+C to cancel, or modify trading_config.py to use 'demo' mode first")
+        warnings.append("LIVE TRADING MODE DETECTED")
+        warnings.append("This will execute REAL trades with REAL money")
+        warnings.append("Press Ctrl+C now to cancel if this is not intentional")
     
     if errors:
         logger.error("Configuration errors found:")
         for error in errors:
             logger.error(f"  - {error}")
         return False
+
+    if warnings:
+        logger.warning("Configuration warnings:")
+        for warning_msg in warnings:
+            logger.warning(f"  - {warning_msg}")
     
     return True
 

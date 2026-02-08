@@ -439,6 +439,150 @@ class MT5Connector:
         """
         return self._last_connection_check
     
+    def place_order(self, symbol: str, action: str, volume: float, price: float, 
+                   stop_loss: float = None, take_profit: float = None, 
+                   deviation: int = 10, magic: int = 123456) -> Optional[Dict[str, Any]]:
+        """
+        Place market order
+        
+        Args:
+            symbol: Trading symbol
+            action: 'BUY' or 'SELL'
+            volume: Order volume
+            price: Order price
+            stop_loss: Stop loss price
+            take_profit: Take profit price
+            deviation: Price deviation
+            magic: Magic number
+            
+        Returns:
+            Order result dictionary or None
+        """
+        try:
+            symbol_info = self.get_symbol_info(symbol)
+            if not symbol_info:
+                return None
+            
+            # Determine order type
+            order_type = mt5.ORDER_TYPE_BUY if action.upper() == 'BUY' else mt5.ORDER_TYPE_SELL
+            
+            # Get current price if not provided
+            if price is None:
+                if action.upper() == 'BUY':
+                    price = symbol_info['ask']
+                else:
+                    price = symbol_info['bid']
+            
+            # Create order request
+            order_request = {
+                'action': mt5.TRADE_ACTION_DEAL,
+                'symbol': symbol,
+                'volume': volume,
+                'type': order_type,
+                'price': price,
+                'deviation': deviation,
+                'magic': magic,
+                'comment': 'Neural Trading',
+                'type_time': mt5.ORDER_TIME_GTC,
+                'type_filling': mt5.ORDER_FILLING_IOC,
+            }
+            
+            # Add SL/TP if provided
+            if stop_loss is not None:
+                order_request['sl'] = stop_loss
+            if take_profit is not None:
+                order_request['tp'] = take_profit
+            
+            if not self.is_connected():
+                return None
+            
+            result = mt5.order_send(order_request)
+            if result:
+                return {
+                    'retcode': result.retcode,
+                    'deal': result.deal,
+                    'order': result.order,
+                    'volume': result.volume,
+                    'price': result.price,
+                    'bid': result.bid,
+                    'ask': result.ask,
+                    'comment': result.comment,
+                    'request_id': result.request_id,
+                    'retcode_external': result.retcode_external
+                }
+            
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Error placing order: {e}")
+            return None
+    
+    def close_position(self, ticket: int, deviation: int = 10) -> Optional[Dict[str, Any]]:
+        """
+        Close position by ticket
+        
+        Args:
+            ticket: Position ticket
+            deviation: Price deviation
+            
+        Returns:
+            Close result or None
+        """
+        try:
+            # Get position info
+            positions = self.get_positions()
+            position = next((p for p in positions if p['ticket'] == ticket), None)
+            
+            if not position:
+                return None
+            
+            # Create close request
+            close_request = {
+                'action': mt5.TRADE_ACTION_DEAL,
+                'symbol': position['symbol'],
+                'volume': position['volume'],
+                'type': mt5.ORDER_TYPE_SELL if position['type'] == 0 else mt5.ORDER_TYPE_BUY,  # Reverse order type
+                'position': ticket,
+                'deviation': deviation,
+                'magic': position['magic'],
+                'comment': 'Close position',
+                'type_time': mt5.ORDER_TIME_GTC,
+                'type_filling': mt5.ORDER_FILLING_IOC,
+            }
+            
+            # Get current price for closing
+            symbol_info = self.get_symbol_info(position['symbol'])
+            if symbol_info:
+                if position['type'] == 0:  # Buy position
+                    close_request['price'] = symbol_info['bid']
+                else:  # Sell position
+                    close_request['price'] = symbol_info['ask']
+            
+            if not self.is_connected():
+                return None
+            
+            result = mt5.order_send(close_request)
+            if result:
+                return {
+                    'retcode': result.retcode,
+                    'deal': result.deal,
+                    'order': result.order,
+                    'volume': result.volume,
+                    'price': result.price,
+                    'bid': result.bid,
+                    'ask': result.ask,
+                    'comment': result.comment,
+                    'request_id': result.request_id,
+                    'retcode_external': result.retcode_external,
+                    'profit': getattr(result, 'profit', 0.0)
+                }
+            
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Error closing position {ticket}: {e}")
+            return None
+    
     def __del__(self):
         """Destructor to ensure proper cleanup"""
         if self._connected:

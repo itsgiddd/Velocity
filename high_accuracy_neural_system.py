@@ -496,12 +496,28 @@ class HighAccuracyTrader:
     Main trading system designed for 78%+ accuracy
     """
     
-    def __init__(self, confidence_threshold: float = 0.75):
+    def __init__(self, confidence_threshold: float = 0.78):
         self.confidence_threshold = confidence_threshold
         self.feature_engine = AdvancedFeatureEngine()
         self.regime_detector = MarketRegimeDetector()
-        self.model = None
         self.is_trained = False
+        self.training_history = []
+        self.model_metadata = {}
+        
+        # Enhanced performance tracking
+        self.performance_tracker = {
+            'recent_predictions': [],
+            'accuracy_history': [],
+            'confidence_calibration': [],
+            'regime_performance': {},
+            'feature_importance': {}
+        }
+        
+        # Model ensemble for robustness
+        self.ensemble_models = []
+        self.ensemble_weights = []
+        
+        logger.info(f"HighAccuracyTrader initialized with confidence threshold: {confidence_threshold}")
         
     def prepare_data(self, data: pd.DataFrame, symbol: str) -> Tuple[np.ndarray, np.ndarray, Dict]:
         """Prepare data for training with advanced features"""
@@ -764,6 +780,219 @@ class HighAccuracyTrader:
             'regime_info': regime_info,
             'feature_count': features.shape[1]
         }
+    
+    def predict_with_enhanced_confidence(self, data: pd.DataFrame, symbol: str) -> Dict[str, Any]:
+        """
+        Enhanced prediction with confidence calibration and performance tracking
+        """
+        try:
+            # Create advanced features
+            features = self.feature_engine.create_advanced_features(data, symbol)
+            
+            # Detect market regime
+            regime_info = self.regime_detector.detect_regime(data, features)
+            
+            # Check if we have enough data
+            if len(features) < 50:
+                return {
+                    'decision': 'HOLD',
+                    'confidence': 0.0,
+                    'reason': 'Insufficient data for prediction',
+                    'regime_info': regime_info
+                }
+            
+            # Get ensemble predictions if available
+            if self.ensemble_models:
+                ensemble_predictions = self._get_ensemble_prediction(features)
+                base_confidence = ensemble_predictions['confidence']
+                probabilities = ensemble_predictions['probabilities']
+            else:
+                # Fallback to single model prediction
+                prediction = self.predict(data, symbol)
+                return prediction  # Return early if no ensemble
+            
+            # Enhanced confidence calibration
+            calibrated_confidence = self._calibrate_confidence(
+                base_confidence, regime_info, features
+            )
+            
+            # Performance-based confidence adjustment
+            performance_adjusted_confidence = self._adjust_confidence_by_performance(
+                calibrated_confidence, regime_info['volatility_regime']
+            )
+            
+            # Decision with enhanced logic
+            if performance_adjusted_confidence < self.confidence_threshold:
+                decision = 'HOLD'
+                reason = f'Calibrated confidence {performance_adjusted_confidence:.3f} below threshold {self.confidence_threshold:.3f}'
+            elif not regime_info['trade_allowed']:
+                decision = 'HOLD'
+                reason = f'Regime not suitable for trading: {regime_info["volatility_regime"]}'
+            else:
+                # Use ensemble consensus
+                if probabilities['BUY'] > probabilities['SELL'] and probabilities['BUY'] > 0.45:
+                    decision = 'BUY'
+                    reason = f'Enhanced BUY signal: {probabilities["BUY"]:.3f} (confidence: {performance_adjusted_confidence:.3f})'
+                elif probabilities['SELL'] > probabilities['BUY'] and probabilities['SELL'] > 0.45:
+                    decision = 'SELL'
+                    reason = f'Enhanced SELL signal: {probabilities["SELL"]:.3f} (confidence: {performance_adjusted_confidence:.3f})'
+                else:
+                    decision = 'HOLD'
+                    reason = f'Insufficient consensus: BUY={probabilities["BUY"]:.3f}, SELL={probabilities["SELL"]:.3f}'
+            
+            # Record prediction for performance tracking
+            self._record_prediction({
+                'decision': decision,
+                'confidence': performance_adjusted_confidence,
+                'regime': regime_info['volatility_regime'],
+                'timestamp': datetime.now()
+            })
+            
+            return {
+                'decision': decision,
+                'confidence': performance_adjusted_confidence,
+                'probabilities': probabilities,
+                'reason': reason,
+                'regime_info': regime_info,
+                'base_confidence': base_confidence,
+                'calibrated_confidence': calibrated_confidence,
+                'ensemble_agreement': ensemble_predictions.get('agreement', 0.0),
+                'feature_count': features.shape[1]
+            }
+            
+        except Exception as e:
+            logger.error(f"Enhanced prediction failed: {e}")
+            return {
+                'decision': 'HOLD',
+                'confidence': 0.0,
+                'reason': f'Prediction error: {str(e)}',
+                'error': str(e)
+            }
+    
+    def _calibrate_confidence(self, base_confidence: float, regime_info: Dict, features: pd.DataFrame) -> float:
+        """Calibrate confidence based on market conditions"""
+        calibrated = base_confidence
+        
+        # Volatility adjustment
+        vol_regime = regime_info.get('volatility_regime', 'NORMAL_VOLATILITY')
+        vol_adjustments = {
+            'LOW_VOLATILITY': 0.05,
+            'NORMAL_VOLATILITY': 0.0,
+            'HIGH_VOLATILITY': -0.10,
+            'EXTREME_VOLATILITY': -0.20
+        }
+        calibrated += vol_adjustments.get(vol_regime, 0.0)
+        
+        # Trend strength adjustment
+        trend_strength = regime_info.get('trend_strength', 0.0)
+        if trend_strength > 0.02:  # Strong trend
+            calibrated += 0.05
+        elif trend_strength < 0.005:  # Weak trend
+            calibrated -= 0.03
+        
+        # Market phase adjustment
+        market_phase = regime_info.get('market_phase', 'NEUTRAL')
+        if market_phase in ['OVERSOLD', 'OVERBOUGHT']:
+            calibrated += 0.03  # Better signals at extremes
+        
+        return np.clip(calibrated, 0.0, 1.0)
+    
+    def _adjust_confidence_by_performance(self, confidence: float, vol_regime: str) -> float:
+        """Adjust confidence based on historical performance in similar conditions"""
+        try:
+            regime_performance = self.performance_tracker['regime_performance'].get(vol_regime, {})
+            
+            if not regime_performance:
+                return confidence
+            
+            # Get performance metrics
+            accuracy = regime_performance.get('accuracy', 0.5)
+            sample_count = regime_performance.get('sample_count', 0)
+            
+            # Adjust confidence based on historical accuracy
+            if sample_count >= 10:  # Minimum sample size
+                performance_factor = (accuracy - 0.5) * 2  # Scale to -1 to 1
+                adjusted_confidence = confidence * (1.0 + performance_factor * 0.2)
+            else:
+                # Conservative adjustment for limited data
+                adjusted_confidence = confidence * 0.9
+            
+            return np.clip(adjusted_confidence, 0.0, 1.0)
+            
+        except Exception as e:
+            logger.warning(f"Performance adjustment failed: {e}")
+            return confidence
+    
+    def _get_ensemble_prediction(self, features: pd.DataFrame) -> Dict[str, Any]:
+        """Get prediction from ensemble of models"""
+        if not self.ensemble_models:
+            raise ValueError("No ensemble models available")
+        
+        try:
+            # Prepare input sequence
+            sequence = features.values[-50:]  # Use last 50 timesteps
+            sequence = np.expand_dims(sequence, axis=0)  # Add batch dimension
+            
+            predictions = []
+            confidences = []
+            
+            # Get prediction from each model
+            for model in self.ensemble_models:
+                with torch.no_grad():
+                    output = model(torch.tensor(sequence, dtype=torch.float32))
+                    if isinstance(output, dict):
+                        probs = torch.softmax(output['prediction'], dim=-1).numpy()[0]
+                        conf = output['confidence'].item()
+                    else:
+                        probs = torch.softmax(output, dim=-1).numpy()[0]
+                        conf = np.max(probs)
+                    
+                    predictions.append(probs)
+                    confidences.append(conf)
+            
+            # Calculate ensemble prediction
+            avg_predictions = np.mean(predictions, axis=0)
+            avg_confidence = np.mean(confidences)
+            agreement = 1.0 - np.std(confidences)  # Model agreement measure
+            
+            return {
+                'probabilities': {
+                    'HOLD': avg_predictions[0],
+                    'BUY': avg_predictions[1],
+                    'SELL': avg_predictions[2]
+                },
+                'confidence': avg_confidence,
+                'agreement': agreement
+            }
+            
+        except Exception as e:
+            logger.error(f"Ensemble prediction failed: {e}")
+            raise
+    
+    def _record_prediction(self, prediction_data: Dict[str, Any]):
+        """Record prediction for performance tracking"""
+        try:
+            self.performance_tracker['recent_predictions'].append(prediction_data)
+            
+            # Keep only recent predictions (last 100)
+            if len(self.performance_tracker['recent_predictions']) > 100:
+                self.performance_tracker['recent_predictions'] = \
+                    self.performance_tracker['recent_predictions'][-100:]
+            
+            # Update regime performance
+            regime = prediction_data['regime']
+            if regime not in self.performance_tracker['regime_performance']:
+                self.performance_tracker['regime_performance'][regime] = {
+                    'sample_count': 0,
+                    'correct_predictions': 0,
+                    'accuracy': 0.0
+                }
+            
+            # Note: Actual accuracy calculation would need outcome data
+            self.performance_tracker['regime_performance'][regime]['sample_count'] += 1
+            
+        except Exception as e:
+            logger.warning(f"Failed to record prediction: {e}")
 
 # Example usage and testing
 if __name__ == "__main__":

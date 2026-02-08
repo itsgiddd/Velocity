@@ -110,9 +110,8 @@ class ConfigManager:
                 'trading_pairs': {
                     'major_pairs': {
                         'EURUSD': {'enabled': True, 'max_risk': 2.0},
-                        'GBPUSD': {'enabled': True, 'max_risk': 2.0},
                         'USDJPY': {'enabled': True, 'max_risk': 2.0},
-                        'AUDUSD': {'enabled': True, 'max_risk': 2.0}
+                        'USDCAD': {'enabled': True, 'max_risk': 2.0}
                     },
                     'minor_pairs': {
                         'USDCAD': {'enabled': False, 'max_risk': 1.5},

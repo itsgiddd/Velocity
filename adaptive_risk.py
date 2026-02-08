@@ -1,71 +1,96 @@
+from typing import Any
+
+try:
+    import MetaTrader5 as mt5
+except Exception:  # pragma: no cover - allows offline unit tests
+    mt5 = None
+
+
 class AdaptiveRiskManager:
-<<<<<<< Updated upstream
     """
-    Calculates position size dynamically based on:
-    - Account Money Management Curve (Grow aggressively when small)
-    - Trade Confidence (Confluence Score)
-    - Market Volatility (SL Distance)
+    Position sizing based on account size, confidence, and stop distance.
     """
-    
-    def calculate_lot_size(self, symbol: str, price: float, sl_price: float, confidence_score: int, account_info, symbol_info) -> float:
-        balance = account_info.balance
-        
-        # 1. Base Risk Percentage (Conservative by default)
-        risk_pct = 0.02 # Default 2%
-        if balance < 1000: risk_pct = 0.04
-        elif balance < 5000: risk_pct = 0.03
-        
-        # 2. Adjust for Confidence
-        # Score 6/6 -> 100% of risk
-        # Score 4/6 -> 50% of risk
-        if confidence_score >= 6:
-            risk_mult = 1.0
-        elif confidence_score == 5:
-            risk_mult = 0.8
-        elif confidence_score == 4:
-            risk_mult = 0.5
-        else:
-            return 0.0 # Should be filtered before here, but safety first
-            
-        final_risk_money = balance * risk_pct * risk_mult
-        
-        # 3. Calculate Lot based on SL Distance
-        sl_points = abs(price - sl_price) / symbol_info.point
-        if sl_points == 0: return 0.01
-        
-        # Value of 1 lot per point
-        # trade_tick_value is profit for 1 tick (point) ?
-        # Standard: Profit = (Close - Open) * Volume * ContractSize
-        # Loss = SL_Dist * Volume * ContractSize
-        # Risk = SL_Dist * Volume * ContractSize
-        # Volume = Risk / (SL_Dist * ContractSize)
-        
-        # Approximation for Forex using tick_value (usually accurate for standard accounts)
-        tick_value = symbol_info.trade_tick_value 
-        if tick_value <= 0: tick_value = 1.0 # Fallback
-        
+
+    def _get_attr(self, obj: Any, name: str, default: float = 0.0) -> float:
+        try:
+            return float(getattr(obj, name))
+        except Exception:
+            return default
+
+    def _normalize_confidence(self, confidence_score: float) -> float:
+        # Supports both 0..1 confidence and integer confluence scores.
+        if confidence_score > 1.0:
+            return min(max(confidence_score / 8.0, 0.0), 1.0)
+        return min(max(confidence_score, 0.0), 1.0)
+
+    def calculate_lot_size(
+        self,
+        symbol: str,
+        price: float,
+        sl_price: float,
+        confidence_score: float,
+        account_info,
+        symbol_info,
+    ) -> float:
+        balance = self._get_attr(account_info, "balance", 0.0)
+        if balance <= 0:
+            return 0.0
+
+        point = self._get_attr(symbol_info, "point", 0.0)
+        if point <= 0:
+            return 0.0
+
+        # Base risk curve by balance.
+        risk_pct = 0.02
+        if balance < 1000:
+            risk_pct = 0.04
+        elif balance < 5000:
+            risk_pct = 0.03
+
+        conf = self._normalize_confidence(confidence_score)
+        if conf < 0.35:
+            return 0.0
+
+        # Scale risk by confidence (35% -> 25% risk, 100% -> 100% risk).
+        risk_mult = 0.25 + 0.75 * conf
+        risk_money = balance * risk_pct * risk_mult
+
+        sl_points = abs(price - sl_price) / point
+        if sl_points <= 0:
+            return 0.0
+
+        tick_value = self._get_attr(symbol_info, "trade_tick_value", 0.0)
+        if tick_value <= 0:
+            tick_value = 1.0
+
         loss_per_lot = sl_points * tick_value
-        if loss_per_lot <= 0: return 0.01
-        
-        lot = final_risk_money / loss_per_lot
-        
-        # 4. Normalize Lot Size
-        step = symbol_info.volume_step
-        min_vol = symbol_info.volume_min
-        max_vol = symbol_info.volume_max
-        
-        lot = round(lot / step) * step
-        if lot < min_vol: lot = min_vol # Or 0 if strictly adhering to risk? User is aggressive.
-        if lot > max_vol: lot = max_vol
-        
-        # 5. Margin Check
-        margin = mt5.order_calc_margin(mt5.TRADE_ACTION_DEAL, symbol, lot, price)
-        if margin > account_info.margin_free * 0.95:
-             lot = lot * (account_info.margin_free * 0.95 / margin)
-             lot = round(lot / step) * step
-             
-        return lot
-=======
-    def calculate_lot_size(self, symbol, entry, sl, score, account_info, symbol_info):
-        return 0.01
->>>>>>> Stashed changes
+        if loss_per_lot <= 0:
+            return 0.0
+
+        raw_lot = risk_money / loss_per_lot
+
+        step = self._get_attr(symbol_info, "volume_step", 0.01)
+        min_vol = self._get_attr(symbol_info, "volume_min", 0.01)
+        max_vol = self._get_attr(symbol_info, "volume_max", 100.0)
+
+        if step <= 0:
+            step = 0.01
+
+        lot = round(raw_lot / step) * step
+        lot = max(min_vol, min(lot, max_vol))
+
+        free_margin = self._get_attr(account_info, "free_margin", 0.0)
+        if free_margin <= 0:
+            free_margin = self._get_attr(account_info, "margin_free", 0.0)
+
+        if mt5 is not None and free_margin > 0 and mt5.initialize():
+            try:
+                margin_needed = mt5.order_calc_margin(mt5.ORDER_TYPE_BUY, symbol, lot, price)
+                if margin_needed and margin_needed > free_margin * 0.95:
+                    lot *= (free_margin * 0.95 / margin_needed)
+                    lot = round(lot / step) * step
+            except Exception:
+                pass
+
+        lot = max(min_vol, min(lot, max_vol))
+        return float(round(lot, 2))
