@@ -484,21 +484,8 @@ class TradingApp(QMainWindow):
             except Exception:
                 pass
 
-        if mt5_ok and model_ok and not self.is_trading:
+        if mt5_ok and not self.is_trading:
             self.btn_start.setEnabled(True)
-
-        # Sync UI settings → engine every tick while trading
-        if self.is_trading and self.trading_engine:
-            self.trading_engine.zeropoint_fixed_lot = self._float(self.inp_lot, 0.40)
-            self.trading_engine.zp_max_loss_dollars = self._float(self.inp_maxloss, 80)
-            self.trading_engine.zp_breakeven_pips = self._float(self.inp_be, 15)
-            self.trading_engine.zp_stall_minutes = self._float(self.inp_stall, 30)
-            self.trading_engine.zp_close_deadline_minutes = self._float(self.inp_deadline, 60)
-            self.trading_engine.confidence_threshold = self._float(self.inp_conf, 65) / 100
-            # Sync pair selection
-            self.trading_engine.zeropoint_skip_symbols = {
-                p for p, c in self.pair_checks.items() if not c.isChecked()
-            }
 
         self._refresh_positions()
 
@@ -847,75 +834,260 @@ class TradingApp(QMainWindow):
         threading.Thread(target=_work, daemon=True).start()
 
     def _on_start(self):
+        """Start the ZP trade scanner — uses exact zp_trade_now.py logic."""
         try:
             if not self.mt5_connector.is_connected():
                 self._log("Connect MT5 first")
                 return
-            if not self.model_manager.is_model_loaded():
-                self._log("Load model first")
-                return
 
-            risk = self._float(self.inp_risk, 8) / 100
-            conf = self._float(self.inp_conf, 65) / 100
-            selected = [p for p, c in self.pair_checks.items() if c.isChecked()]
-
-            self.trading_engine = TradingEngine(
-                mt5_connector=self.mt5_connector,
-                model_manager=self.model_manager,
-                risk_per_trade=risk,
-                confidence_threshold=conf,
-                trading_pairs=selected,
-            )
-
-            zp = self.chk_zp.isChecked()
-            self.trading_engine.zeropoint_pure_mode = zp
-            if zp:
-                self.trading_engine.zeropoint_fixed_lot = self._float(self.inp_lot, 0.40)
-                self.trading_engine.zeropoint_skip_symbols = {
-                    p for p, c in self.pair_checks.items() if not c.isChecked()
-                }
-                self.trading_engine.zp_max_loss_dollars = self._float(self.inp_maxloss, 80)
-                self.trading_engine.zp_breakeven_pips = self._float(self.inp_be, 15)
-                self.trading_engine.zp_stall_minutes = self._float(self.inp_stall, 30)
-                self.trading_engine.zp_close_deadline_minutes = self._float(self.inp_deadline, 60)
-
-                self._log(
-                    f"ZP Pure | Lot: {self.trading_engine.zeropoint_fixed_lot} | "
-                    f"Max loss: ${self.trading_engine.zp_max_loss_dollars} | "
-                    f"BE: {self.trading_engine.zp_breakeven_pips}pip | "
-                    f"Stall: {self.trading_engine.zp_stall_minutes}m"
-                )
-
-            # Agentic orchestrator is optional (self-learning daemon)
-            if AgenticOrchestrator is not None:
-                try:
-                    self.orchestrator = AgenticOrchestrator(
-                        model_manager=self.model_manager,
-                        trading_engine=self.trading_engine,
-                    )
-                    self.trading_engine.orchestrator = self.orchestrator
-                    self.orchestrator.start()
-                except Exception as e:
-                    self._log(f"Orchestrator skipped: {e}")
-                    self.orchestrator = None
-
-            self.trading_engine.start()
+            self._zp_running = True
             self.is_trading = True
-
             self.btn_start.setEnabled(False)
             self.btn_stop.setEnabled(True)
-            mode = "ZP Pure" if zp else "Neural"
-            self._log(f"Trading started ({mode}) - {len(selected)} pairs")
+
+            lot = self._float(self.inp_lot, 0.40)
+            self._log(f"ZP Scanner started | Lot: {lot} | Scanning every 60s for fresh H4 flips")
+
+            def _zp_loop():
+                import MetaTrader5 as mt5_lib
+                import numpy as np
+                import pandas as pd
+                from app.zeropoint_signal import (
+                    ZeroPointEngine, compute_zeropoint_state,
+                    ZEROPOINT_ENABLED_SYMBOLS, SL_BUFFER_PCT, TP1_MULT,
+                )
+
+                zp_engine = ZeroPointEngine()
+
+                while getattr(self, '_zp_running', False):
+                    try:
+                        selected = [p for p, c in self.pair_checks.items() if c.isChecked()]
+                        fixed_lot = self._float(self.inp_lot, 0.40)
+
+                        # Skip if we already have open positions
+                        open_positions = mt5_lib.positions_get()
+                        open_symbols = set()
+                        if open_positions:
+                            for pos in open_positions:
+                                open_symbols.add(pos.symbol.upper().replace(".", "").replace("#", ""))
+
+                        best_signal = None
+                        best_symbol_resolved = None
+
+                        for symbol in selected:
+                            norm = symbol.upper().replace(".", "").replace("#", "")
+                            if norm in open_symbols or symbol in open_symbols:
+                                continue
+
+                            # Resolve symbol on broker
+                            sym_info = mt5_lib.symbol_info(symbol)
+                            sym_resolved = symbol
+                            if sym_info is None:
+                                for alt in [symbol, symbol + ".raw", symbol[:3]]:
+                                    sym_info = mt5_lib.symbol_info(alt)
+                                    if sym_info is not None:
+                                        sym_resolved = alt
+                                        break
+                            if sym_info is None:
+                                continue
+
+                            mt5_lib.symbol_select(sym_resolved, True)
+
+                            rates_h4 = mt5_lib.copy_rates_from_pos(sym_resolved, mt5_lib.TIMEFRAME_H4, 0, 200)
+                            rates_h1 = mt5_lib.copy_rates_from_pos(sym_resolved, mt5_lib.TIMEFRAME_H1, 0, 200)
+
+                            df_h4 = None
+                            if rates_h4 is not None and len(rates_h4) >= 20:
+                                df_h4 = pd.DataFrame(rates_h4)
+                                df_h4["time"] = pd.to_datetime(df_h4["time"], unit="s")
+                            df_h1 = None
+                            if rates_h1 is not None and len(rates_h1) >= 20:
+                                df_h1 = pd.DataFrame(rates_h1)
+                                df_h1["time"] = pd.to_datetime(df_h1["time"], unit="s")
+                            if df_h4 is None:
+                                continue
+
+                            # Try standard ZP engine, then raw fallback
+                            sig = None
+                            if norm in ZEROPOINT_ENABLED_SYMBOLS:
+                                sig = zp_engine.generate_signal(sym_resolved, df_h4, df_h1)
+                            if sig is None:
+                                sig = self._zp_signal_fresh_only(sym_resolved, df_h4, df_h1)
+                            if sig is None:
+                                continue
+
+                            self._log(
+                                f"  {symbol}: ZP {sig.direction} "
+                                f"R:R={sig.risk_reward:.2f} conf={sig.confidence:.0%} tier={sig.tier}"
+                            )
+                            if best_signal is None or sig.confidence > best_signal.confidence:
+                                best_signal = sig
+                                best_symbol_resolved = sym_resolved
+
+                        if best_signal is not None:
+                            self._zp_place_trade(best_signal, best_symbol_resolved, fixed_lot)
+                        else:
+                            self._log("Scan: no fresh H4 flip found")
+
+                    except Exception as e:
+                        self._log(f"Scan error: {e}")
+
+                    # Wait 60s between scans (H4 data, no need to spam)
+                    for _ in range(60):
+                        if not getattr(self, '_zp_running', False):
+                            break
+                        _time.sleep(1)
+
+            threading.Thread(target=_zp_loop, daemon=True).start()
 
         except Exception as e:
             self._log(f"Start error: {e}")
 
+    @staticmethod
+    def _zp_signal_fresh_only(symbol, df_h4, df_h1=None):
+        """Exact zp_trade_now.py logic — FRESH FLIPS ONLY."""
+        import numpy as np
+        from app.zeropoint_signal import (
+            compute_zeropoint_state, ZeroPointSignal,
+            SL_BUFFER_PCT, TP1_MULT,
+        )
+        from datetime import datetime
+
+        zp = compute_zeropoint_state(df_h4)
+        if zp is None or len(zp) < 2:
+            return None
+
+        last = zp.iloc[-1]
+        pos = int(last.get("pos", 0))
+        if pos == 0:
+            return None
+
+        direction = "BUY" if pos == 1 else "SELL"
+
+        # FRESH FLIP ONLY — current bar or 1-bar-ago
+        buy_sig = bool(last.get("buy_signal", False))
+        sell_sig = bool(last.get("sell_signal", False))
+        is_fresh = buy_sig or sell_sig
+        if not is_fresh:
+            prev = zp.iloc[-2]
+            is_fresh = bool(prev.get("buy_signal", False)) or bool(prev.get("sell_signal", False))
+        if not is_fresh:
+            return None
+
+        entry = float(last["close"])
+        atr_val = float(last["atr"])
+        if atr_val <= 0 or np.isnan(atr_val):
+            return None
+
+        trailing_stop = float(last.get("xATRTrailingStop", 0))
+        if trailing_stop <= 0:
+            return None
+
+        sl = trailing_stop
+        buffer = atr_val * SL_BUFFER_PCT
+        if direction == "BUY":
+            sl = sl - buffer
+            tp1 = entry + atr_val * TP1_MULT
+        else:
+            sl = sl + buffer
+            tp1 = entry - atr_val * TP1_MULT
+
+        if direction == "BUY" and entry >= tp1:
+            return None
+        if direction == "SELL" and entry <= tp1:
+            return None
+
+        sl_dist = abs(entry - sl)
+        tp_dist = abs(tp1 - entry)
+        rr = tp_dist / sl_dist if sl_dist > 0 else 0
+
+        # H1 confirmation
+        h1_conf = False
+        if df_h1 is not None:
+            zp_h1 = compute_zeropoint_state(df_h1)
+            if zp_h1 is not None and len(zp_h1) > 0:
+                h1_pos = int(zp_h1.iloc[-1].get("pos", 0))
+                if direction == "BUY" and h1_pos == 1:
+                    h1_conf = True
+                elif direction == "SELL" and h1_pos == -1:
+                    h1_conf = True
+
+        conf = 0.70 + (0.15 if h1_conf else 0.0) + min(rr * 0.05, 0.10)
+        conf = max(0.50, min(conf, 0.98))
+        tier = "S" if h1_conf else "A"
+
+        return ZeroPointSignal(
+            symbol=symbol, direction=direction, entry_price=entry,
+            stop_loss=sl, tp1=tp1, tp2=tp1, tp3=tp1,
+            atr_value=atr_val, confidence=conf,
+            signal_time=datetime.now(), timeframe="H4",
+            tier=tier, trailing_stop=trailing_stop,
+            risk_reward=rr,
+        )
+
+    def _zp_place_trade(self, sig, sym_resolved, lot):
+        """Place a trade exactly like zp_trade_now.py."""
+        try:
+            import MetaTrader5 as mt5_lib
+
+            sym_info = mt5_lib.symbol_info(sym_resolved)
+            if sym_info is None:
+                self._log(f"Cannot get info for {sym_resolved}")
+                return
+
+            if sig.direction == "BUY":
+                order_type = mt5_lib.ORDER_TYPE_BUY
+                price = sym_info.ask
+            else:
+                order_type = mt5_lib.ORDER_TYPE_SELL
+                price = sym_info.bid
+
+            digits = sym_info.digits
+            sl = round(sig.stop_loss, digits)
+            tp = round(sig.tp1, digits)
+
+            request = {
+                "action": mt5_lib.TRADE_ACTION_DEAL,
+                "symbol": sym_resolved,
+                "volume": lot,
+                "type": order_type,
+                "price": price,
+                "sl": sl,
+                "tp": tp,
+                "deviation": 20,
+                "magic": 123456,
+                "comment": f"ZP-{sig.tier}",
+                "type_time": mt5_lib.ORDER_TIME_GTC,
+                "type_filling": mt5_lib.ORDER_FILLING_FOK,
+            }
+
+            result = mt5_lib.order_send(request)
+            if result and result.retcode == mt5_lib.TRADE_RETCODE_DONE:
+                self._log(
+                    f"<span style='color:#44cc66'>TRADE: {sig.direction} {sym_resolved} "
+                    f"@ {price:.5f} | SL={sl} TP={tp} | "
+                    f"R:R={sig.risk_reward:.2f} Tier={sig.tier}</span>"
+                )
+            else:
+                # Try other fill modes
+                for fill in [mt5_lib.ORDER_FILLING_IOC, mt5_lib.ORDER_FILLING_RETURN]:
+                    request["type_filling"] = fill
+                    result = mt5_lib.order_send(request)
+                    if result and result.retcode == mt5_lib.TRADE_RETCODE_DONE:
+                        self._log(
+                            f"<span style='color:#44cc66'>TRADE: {sig.direction} {sym_resolved} "
+                            f"@ {price:.5f} | SL={sl} TP={tp}</span>"
+                        )
+                        return
+                rc = result.retcode if result else "?"
+                self._log(f"<span style='color:#ff4444'>Trade failed {sym_resolved}: {rc}</span>")
+
+        except Exception as e:
+            self._log(f"Trade error: {e}")
+
     def _on_stop(self):
         try:
-            if self.orchestrator:
-                self.orchestrator.stop()
-            if self.trading_engine:
-                self.trading_engine.stop()
+            self._zp_running = False
             self.is_trading = False
             self.btn_start.setEnabled(True)
             self.btn_stop.setEnabled(False)
@@ -925,10 +1097,7 @@ class TradingApp(QMainWindow):
 
     def _on_emergency(self):
         try:
-            if self.orchestrator:
-                self.orchestrator.stop()
-            if self.trading_engine:
-                self.trading_engine.stop()
+            self._zp_running = False
             self.is_trading = False
             self.btn_start.setEnabled(True)
             self.btn_stop.setEnabled(False)
