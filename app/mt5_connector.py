@@ -14,10 +14,14 @@ Features:
 - Connection status monitoring
 """
 
-import MetaTrader5 as mt5
 import logging
 from datetime import datetime
 from typing import Dict, List, Optional, Any
+
+try:
+    import MetaTrader5 as mt5
+except ImportError:
+    mt5 = None  # Will fail gracefully at connect() time
 
 class MT5Connector:
     """Professional MT5 connection handler"""
@@ -45,8 +49,8 @@ class MT5Connector:
         Priority is exact and full-symbol matches (e.g., BTCUSD*) before base-only aliases (BTC).
         """
         requested = str(symbol or "").strip()
-        if not requested:
-            return []
+        if not requested or mt5 is None:
+            return [requested] if requested else []
 
         requested_upper = requested.upper()
         candidates: List[str] = []
@@ -145,8 +149,12 @@ class MT5Connector:
             bool: True if connection successful
         """
         try:
+            if mt5 is None:
+                self.logger.error("MetaTrader5 package not installed. Run: pip install MetaTrader5")
+                return False
+
             self.logger.info("Attempting to connect to MT5...")
-            
+
             # Try automatic connection first (using saved MT5 credentials)
             if not mt5.initialize():
                 error = mt5.last_error()
@@ -270,11 +278,11 @@ class MT5Connector:
     def is_connected(self) -> bool:
         """
         Check if connected to MT5
-        
+
         Returns:
             bool: True if connected
         """
-        if not self._connected:
+        if not self._connected or mt5 is None:
             return False
         
         # Verify connection is still active

@@ -15,8 +15,12 @@ Features:
 """
 
 import json
-import yaml
 import logging
+
+try:
+    import yaml
+except ImportError:
+    yaml = None  # Will use JSON fallback
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from datetime import datetime
@@ -170,8 +174,11 @@ class ConfigManager:
         try:
             if config_file.exists():
                 with open(config_file, 'r', encoding='utf-8') as f:
-                    if config_file.suffix.lower() == '.yaml':
+                    if config_file.suffix.lower() == '.yaml' and yaml is not None:
                         config = yaml.safe_load(f)
+                    elif config_file.suffix.lower() == '.yaml' and yaml is None:
+                        # yaml not installed — skip loading
+                        return default_config.copy()
                     else:
                         config = json.load(f)
                 
@@ -227,7 +234,7 @@ class ConfigManager:
             config_file.parent.mkdir(parents=True, exist_ok=True)
             
             with open(config_file, 'w', encoding='utf-8') as f:
-                if config_file.suffix.lower() == '.yaml':
+                if config_file.suffix.lower() == '.yaml' and yaml is not None:
                     yaml.dump(config, f, default_flow_style=False, indent=2, allow_unicode=True)
                 else:
                     json.dump(config, f, indent=2, ensure_ascii=False)

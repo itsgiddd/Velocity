@@ -21,11 +21,26 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer, Signal, QObject
 from PySide6.QtGui import QFont, QColor, QIcon
 
-from app.trading_engine import TradingEngine
-from app.model_manager import NeuralModelManager
-from app.mt5_connector import MT5Connector
-from app.config_manager import ConfigManager
-from agentic_orchestrator import AgenticOrchestrator
+# Safe imports — show clear errors instead of silent crashes
+_IMPORT_ERRORS = []
+
+try:
+    import MetaTrader5 as _mt5_check
+except ImportError:
+    _IMPORT_ERRORS.append("MetaTrader5 not installed. Run: pip install MetaTrader5")
+
+try:
+    from app.trading_engine import TradingEngine
+    from app.model_manager import NeuralModelManager
+    from app.mt5_connector import MT5Connector
+    from app.config_manager import ConfigManager
+except ImportError as e:
+    _IMPORT_ERRORS.append(f"Core module import failed: {e}")
+
+try:
+    from agentic_orchestrator import AgenticOrchestrator
+except ImportError:
+    AgenticOrchestrator = None  # Optional — trading works without it
 
 # ---------------------------------------------------------------------------
 # Dark theme stylesheet
@@ -181,7 +196,7 @@ class TradingApp(QMainWindow):
         self.mt5_connector = MT5Connector()
         self.model_manager = NeuralModelManager()
         self.trading_engine: Optional[TradingEngine] = None
-        self.orchestrator: Optional[AgenticOrchestrator] = None
+        self.orchestrator = None
         self.is_trading = False
 
         self._build_ui()
@@ -191,7 +206,13 @@ class TradingApp(QMainWindow):
         self.timer.timeout.connect(self._update_live)
         self.timer.start(2000)
 
-        self._log("Ready. Connect MT5 and load model to begin.")
+        # Show import errors if any
+        if _IMPORT_ERRORS:
+            for err in _IMPORT_ERRORS:
+                self._log(f"<span style='color:#ff4444'>⚠ {err}</span>")
+            self._log("<span style='color:#ffcc44'>Fix the above errors then restart the app.</span>")
+        else:
+            self._log("Ready. Connect MT5 and load model to begin.")
 
     # ------------------------------------------------------------------
     def _setup_logging(self):
@@ -737,17 +758,48 @@ class TradingApp(QMainWindow):
             try:
                 self.btn_connect.setEnabled(False)
                 self.btn_connect.setText("Connecting...")
+
+                # Check if MetaTrader5 package is even installed
+                try:
+                    import MetaTrader5 as mt5_lib
+                except ImportError:
+                    self._log("<span style='color:#ff4444'>MetaTrader5 package not installed!</span>")
+                    self._log("Run: <b>pip install MetaTrader5</b>")
+                    return
+
                 ok = self.mt5_connector.connect()
                 if ok:
-                    self._log("MT5 connected")
+                    self._log("<span style='color:#44cc66'>MT5 connected</span>")
                     info = self.mt5_connector.get_account_info()
                     if info:
                         self._log(f"Account: {info.get('login','?')} | "
+                                  f"Server: {info.get('server','?')} | "
                                   f"Balance: ${info.get('balance','?')}")
                 else:
-                    self._log("MT5 connection failed")
+                    # Get the actual error from MT5
+                    try:
+                        err = mt5_lib.last_error()
+                        err_code, err_msg = err if err else (0, "unknown")
+                    except Exception:
+                        err_code, err_msg = 0, "unknown"
+
+                    self._log(f"<span style='color:#ff4444'>MT5 connection failed</span>")
+                    self._log(f"Error: [{err_code}] {err_msg}")
+
+                    # Give helpful advice based on error code
+                    if err_code == -10003 or "IPC" in str(err_msg):
+                        self._log("<span style='color:#ffcc44'>→ MT5 terminal is not running. Open MetaTrader 5 first.</span>")
+                    elif err_code == -10004:
+                        self._log("<span style='color:#ffcc44'>→ MT5 not found. Install MetaTrader 5 from your broker.</span>")
+                    elif err_code == -10005:
+                        self._log("<span style='color:#ffcc44'>→ Wrong MT5 version. Update MetaTrader 5.</span>")
+                    elif "timeout" in str(err_msg).lower():
+                        self._log("<span style='color:#ffcc44'>→ Connection timed out. Check your internet.</span>")
+                    else:
+                        self._log("<span style='color:#ffcc44'>→ Make sure MT5 is open and logged into an account.</span>")
+
             except Exception as e:
-                self._log(f"MT5 error: {e}")
+                self._log(f"<span style='color:#ff4444'>MT5 error: {e}</span>")
             finally:
                 self.btn_connect.setEnabled(True)
                 self.btn_connect.setText("Connect MT5")
@@ -834,12 +886,19 @@ class TradingApp(QMainWindow):
                     f"Stall: {self.trading_engine.zp_stall_minutes}m"
                 )
 
-            self.orchestrator = AgenticOrchestrator(
-                model_manager=self.model_manager,
-                trading_engine=self.trading_engine,
-            )
-            self.trading_engine.orchestrator = self.orchestrator
-            self.orchestrator.start()
+            # Agentic orchestrator is optional (self-learning daemon)
+            if AgenticOrchestrator is not None:
+                try:
+                    self.orchestrator = AgenticOrchestrator(
+                        model_manager=self.model_manager,
+                        trading_engine=self.trading_engine,
+                    )
+                    self.trading_engine.orchestrator = self.orchestrator
+                    self.orchestrator.start()
+                except Exception as e:
+                    self._log(f"Orchestrator skipped: {e}")
+                    self.orchestrator = None
+
             self.trading_engine.start()
             self.is_trading = True
 
