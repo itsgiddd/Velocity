@@ -1151,8 +1151,8 @@ class TradingApp(QMainWindow):
                             )
                             signals.append((sig, sym_resolved, score))
 
-                        # Rank by score, take top 3 only
-                        MAX_TRADES = 3
+                        # Rank by score, take top 2 — concentrate on best setups
+                        MAX_TRADES = 2
                         if signals:
                             signals.sort(key=lambda x: x[2], reverse=True)
                             top = signals[:MAX_TRADES]
@@ -1178,6 +1178,84 @@ class TradingApp(QMainWindow):
                         _time.sleep(1)
 
             threading.Thread(target=_zp_loop, daemon=True).start()
+
+            # --- Trade monitor: enforces max loss, stall, and deadline ---
+            def _monitor_loop():
+                import MetaTrader5 as mt5_lib
+
+                # Track best P/L per ticket (for stall detection)
+                best_pnl = {}
+
+                while getattr(self, '_zp_running', False):
+                    try:
+                        max_loss = self._float(self.inp_maxloss, 80)
+                        stall_min = self._float(self.inp_stall, 30)
+                        deadline_min = self._float(self.inp_deadline, 60)
+
+                        positions = mt5_lib.positions_get()
+                        if not positions:
+                            best_pnl.clear()
+                            _time.sleep(5)
+                            continue
+
+                        now = _time.time()
+
+                        for p in positions:
+                            ticket = p.ticket
+                            pnl = p.profit
+                            age_sec = now - p.time
+                            age_min = age_sec / 60.0
+                            direction = "BUY" if p.type == 0 else "SELL"
+
+                            # Track best P/L for stall detection
+                            if ticket not in best_pnl:
+                                best_pnl[ticket] = pnl
+                            else:
+                                best_pnl[ticket] = max(best_pnl[ticket], pnl)
+
+                            # --- Max Loss: close if loss exceeds limit ---
+                            if pnl <= -max_loss:
+                                self._log(
+                                    f"<span style='color:#C44444'>MAX LOSS: {p.symbol} ${pnl:+.2f} "
+                                    f"(limit -${max_loss:.0f}) — closing</span>"
+                                )
+                                self._close_position_mt5(ticket, p.symbol, direction, p.volume)
+                                continue
+
+                            # --- Deadline: hard close after X minutes ---
+                            if deadline_min > 0 and age_min >= deadline_min:
+                                self._log(
+                                    f"<span style='color:#D4A040'>DEADLINE: {p.symbol} open {age_min:.0f}m "
+                                    f"(limit {deadline_min:.0f}m) P/L=${pnl:+.2f} — closing</span>"
+                                )
+                                self._close_position_mt5(ticket, p.symbol, direction, p.volume)
+                                continue
+
+                            # --- Stall: close if trade hasn't improved after X minutes ---
+                            if stall_min > 0 and age_min >= stall_min:
+                                peak = best_pnl.get(ticket, 0)
+                                # Stall = trade is still negative AND hasn't beaten $1 profit
+                                if pnl < 1.0 and peak < 1.0:
+                                    self._log(
+                                        f"<span style='color:#D4A040'>STALL: {p.symbol} no progress after "
+                                        f"{age_min:.0f}m | P/L=${pnl:+.2f} peak=${peak:+.2f} — closing</span>"
+                                    )
+                                    self._close_position_mt5(ticket, p.symbol, direction, p.volume)
+                                    continue
+
+                        # Clean up stale tickets
+                        open_tickets = {p.ticket for p in positions}
+                        for t in list(best_pnl.keys()):
+                            if t not in open_tickets:
+                                del best_pnl[t]
+
+                    except Exception as e:
+                        self._log(f"Monitor error: {e}")
+
+                    _time.sleep(10)  # Check every 10 seconds
+
+            threading.Thread(target=_monitor_loop, daemon=True).start()
+            self._log("Trade monitor active: max loss / stall / deadline enforcement")
 
         except Exception as e:
             self._log(f"Start error: {e}")
