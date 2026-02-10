@@ -1,5 +1,11 @@
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
+
+try:
+    from push_structure_analyzer import SymbolPushProfile
+    _HAS_PUSH_PROFILE = True
+except ImportError:
+    _HAS_PUSH_PROFILE = False
 
 
 @dataclass
@@ -14,6 +20,8 @@ class TradeDecision:
 class TradeValidator:
     """
     Performs confluence checks before execution.
+    Uses learned per-symbol push profiles when available, falls back to
+    hardcoded rules otherwise.
     """
 
     def _normalize_trend(self, raw_trend) -> int:
@@ -53,16 +61,52 @@ class TradeValidator:
         else:
             reasons.append("No higher timeframe trend boost (+0)")
 
+        # Push structure validation — use learned profile when available.
         push_count = int(max(getattr(pattern, "push_count", 1), 0))
+        push_profile = features.get("push_profile") if _HAS_PUSH_PROFILE else None
+
         if push_count < 1:
             return TradeDecision(False, "Push count below 1", rationale=["Rejected: no impulse structure"])
-        if push_count >= 4:
-            return TradeDecision(False, "Push exhaustion (>=4)", rationale=["Rejected: exhausted structure"])
-        if push_count >= 2:
-            score += 1
-        if push_count >= 3:
-            score += 1
-        reasons.append(f"Push count {push_count} (+{1 if push_count >= 2 else 0}{'+1' if push_count >= 3 else ''})")
+
+        if push_profile is not None and isinstance(push_profile, SymbolPushProfile):
+            # Data-learned exhaustion thresholds.
+            exhaustion_threshold = push_profile.exhaustion_push_count
+            reversal_prob = push_profile.reversal_prob_by_push.get(push_count, 0.0)
+
+            if reversal_prob > 0.65:
+                return TradeDecision(
+                    False,
+                    f"Push exhaustion (P(reversal)={reversal_prob:.0%} at push {push_count})",
+                    rationale=[f"Rejected: learned reversal prob {reversal_prob:.0%} at push {push_count}"],
+                )
+            if push_count >= exhaustion_threshold:
+                return TradeDecision(
+                    False,
+                    f"Push exhaustion (>={exhaustion_threshold} for {push_profile.symbol})",
+                    rationale=[f"Rejected: learned exhaustion at {exhaustion_threshold} pushes"],
+                )
+
+            # Scoring: pushes in [2, exhaustion-1] are the trading sweet spot.
+            if push_count >= 2:
+                score += 1
+            if push_count == exhaustion_threshold - 1:
+                # Right before exhaustion = peak momentum.
+                score += 2
+            elif push_count >= 3:
+                score += 1
+            reasons.append(
+                f"Push count {push_count} (exhaust@{exhaustion_threshold}, "
+                f"P(rev)={reversal_prob:.0%})"
+            )
+        else:
+            # Fallback: hardcoded rules (backward compatible).
+            if push_count >= 4:
+                return TradeDecision(False, "Push exhaustion (>=4)", rationale=["Rejected: exhausted structure"])
+            if push_count >= 2:
+                score += 1
+            if push_count >= 3:
+                score += 1
+            reasons.append(f"Push count {push_count} (+{1 if push_count >= 2 else 0}{'+1' if push_count >= 3 else ''})")
 
         vol_anomaly = float(features.get("vol_anomaly", 1.0))
         volume_score = float(getattr(pattern, "volume_score", 0.5))

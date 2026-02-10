@@ -28,6 +28,19 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+from push_structure_analyzer import (
+    PUSH_FEATURE_COUNT,
+    PushFeatureExtractor,
+    SymbolPushProfile,
+    compute_all_push_profiles,
+    infer_direction_from_closes,
+)
+from pattern_recognition import (
+    PatternRecognizer,
+    FormingPattern,
+    FORMING_PATTERN_FEATURE_COUNT,
+)
+
 warnings.filterwarnings("ignore")
 
 
@@ -35,7 +48,7 @@ LABEL_SELL = 0
 LABEL_HOLD = 1
 LABEL_BUY = 2
 LABEL_NAMES = {0: "SELL", 1: "HOLD", 2: "BUY"}
-BASE_FEATURE_DIM = 16
+BASE_FEATURE_DIM = 38  # 18 price/indicator + 8 push structure + 12 forming pattern features
 M15_BARS_PER_HOUR = 4.0
 WEEK_DAYS_FOR_OBJECTIVE = 5.0
 DEFAULT_WEEKLY_SAMPLES_PER_SYMBOL = M15_BARS_PER_HOUR * 24.0 * WEEK_DAYS_FOR_OBJECTIVE
@@ -249,7 +262,8 @@ def create_features_and_labels(
     data: Dict[str, Dict[str, object]],
     symbol_to_index: Dict[str, int],
     lookback: int = 20,
-    horizon: int = 8
+    horizon: int = 8,
+    push_profiles: Optional[Dict[str, SymbolPushProfile]] = None,
 ) -> DatasetBundle:
     """
     Create training samples with base features + symbol one-hot features.
@@ -259,6 +273,20 @@ def create_features_and_labels(
 
     rows: List[Tuple[pd.Timestamp, str, np.ndarray, int, float, float]] = []
     symbol_count = len(symbol_to_index)
+
+    # Pre-compute forming pattern features for each symbol using a sliding window.
+    # We run the pattern detector every N bars (not every bar) for efficiency.
+    # Multi-TF: We resample M15 to H1 (4:1) and H4 (16:1) and scan ALL timeframes,
+    # picking the strongest forming pattern — matching the live engine's approach.
+    # TIME-AWARE: Only include patterns likely to resolve within ~24hr profit window.
+    # Higher TFs need higher completion to qualify (same thresholds as live engine).
+    PATTERN_SCAN_INTERVAL = 4  # Scan every 4 bars (~1 hour of M15 data)
+    PATTERN_WINDOW = 80  # Look back 80 bars for pattern detection
+    MTF_PAT_CONFIG = {
+        "M15": {"weight": 0.85, "min_completion": 0.40},
+        "H1":  {"weight": 1.0,  "min_completion": 0.55},
+        "H4":  {"weight": 1.15, "min_completion": 0.75},
+    }  # No D1 — not enough M15 data to resample; live engine handles D1 separately
 
     for symbol_key, payload in data.items():
         df = payload["M15"].dropna()
@@ -277,6 +305,66 @@ def create_features_and_labels(
 
         one_hot = np.zeros(symbol_count, dtype=np.float32)
         one_hot[symbol_to_index[symbol_key]] = 1.0
+
+        # Push profile for this symbol (learned from historical swing structure).
+        push_profile = (
+            push_profiles.get(symbol_key, SymbolPushProfile.default(symbol_key))
+            if push_profiles
+            else SymbolPushProfile.default(symbol_key)
+        )
+        # Pre-extract arrays for push feature computation.
+        all_highs = df["high"].astype(float).values
+        all_lows = df["low"].astype(float).values
+        all_closes = df["close"].astype(float).values
+        # Use a wider window for swing detection (need enough bars for structure).
+        push_lookback = max(lookback, 60)
+
+        # Pre-compute forming pattern features for the whole symbol.
+        # Cache pattern features and reuse for nearby bars.
+        # Multi-TF: resample M15 to H1 (4:1) and H4 (16:1) for richer pattern context.
+        cached_pattern_feats: Dict[int, np.ndarray] = {}
+        zero_pattern_feats = np.zeros(FORMING_PATTERN_FEATURE_COUNT, dtype=np.float32)
+
+        # Build resampled dataframes for H1 and H4 (once per symbol).
+        # H1: group every 4 M15 candles; H4: group every 16 M15 candles.
+        _resampled_h1 = None
+        _resampled_h4 = None
+        try:
+            _df_resample = df.copy()
+            # Need a datetime index for proper resampling
+            if not isinstance(_df_resample.index, pd.DatetimeIndex):
+                _df_resample = _df_resample.reset_index(drop=True)
+            # Build H1 by grouping every 4 M15 bars
+            h1_chunks = len(_df_resample) // 4
+            if h1_chunks >= 40:
+                h1_ohlc = []
+                for ci in range(h1_chunks):
+                    chunk = _df_resample.iloc[ci * 4:(ci + 1) * 4]
+                    h1_ohlc.append({
+                        'open': float(chunk['open'].iloc[0]),
+                        'high': float(chunk['high'].max()),
+                        'low': float(chunk['low'].min()),
+                        'close': float(chunk['close'].iloc[-1]),
+                        'tick_volume': float(chunk['tick_volume'].sum()) if 'tick_volume' in chunk.columns else 1.0,
+                    })
+                _resampled_h1 = pd.DataFrame(h1_ohlc)
+
+            # Build H4 by grouping every 16 M15 bars
+            h4_chunks = len(_df_resample) // 16
+            if h4_chunks >= 30:
+                h4_ohlc = []
+                for ci in range(h4_chunks):
+                    chunk = _df_resample.iloc[ci * 16:(ci + 1) * 16]
+                    h4_ohlc.append({
+                        'open': float(chunk['open'].iloc[0]),
+                        'high': float(chunk['high'].max()),
+                        'low': float(chunk['low'].min()),
+                        'close': float(chunk['close'].iloc[-1]),
+                        'tick_volume': float(chunk['tick_volume'].sum()) if 'tick_volume' in chunk.columns else 1.0,
+                    })
+                _resampled_h4 = pd.DataFrame(h4_ohlc)
+        except Exception:
+            pass  # Fall back to M15-only pattern scanning
 
         for i in range(lookback, len(df) - horizon):
             window = df.iloc[i - lookback:i]
@@ -333,7 +421,90 @@ def create_features_and_labels(
                 dtype=np.float32,
             )
 
-            features = np.concatenate([base_features, one_hot]).astype(np.float32)
+            # Push structure features (8 features from swing analysis).
+            push_start = max(0, i - push_lookback)
+            window_highs = all_highs[push_start:i + 1]
+            window_lows = all_lows[push_start:i + 1]
+            window_closes = all_closes[push_start:i + 1]
+            direction = infer_direction_from_closes(window_closes, lookback=10)
+            push_features = PushFeatureExtractor.extract_push_features(
+                highs=window_highs,
+                lows=window_lows,
+                closes=window_closes,
+                profile=push_profile,
+                point=symbol_point,
+                direction=direction,
+            )
+
+            # Forming pattern features (12 features from puzzle-piece detection).
+            # Multi-TF: scan M15, H1, H4 and pick the strongest forming pattern.
+            # Cached every PATTERN_SCAN_INTERVAL bars for efficiency.
+            scan_key = (i // PATTERN_SCAN_INTERVAL) * PATTERN_SCAN_INTERVAL
+            if scan_key not in cached_pattern_feats:
+                try:
+                    best_mtf_score = -1.0
+                    best_mtf_feats = zero_pattern_feats
+
+                    # M15 scan (primary) — time-aware: only patterns >= 40% complete
+                    m15_cfg = MTF_PAT_CONFIG["M15"]
+                    pat_start = max(0, i - PATTERN_WINDOW)
+                    pat_slice = df.iloc[pat_start:i + 1].copy()
+                    if len(pat_slice) >= 25:
+                        rec = PatternRecognizer(pat_slice)
+                        forming_m15 = rec.detect_forming_patterns()
+                        if forming_m15:
+                            filtered_m15 = [fp for fp in forming_m15 if fp.completion_pct >= m15_cfg["min_completion"]]
+                            for fp in filtered_m15:
+                                time_bonus = (fp.completion_pct - m15_cfg["min_completion"]) / (1.0 - m15_cfg["min_completion"] + 1e-8)
+                                sc = fp.confidence * fp.completion_pct * m15_cfg["weight"] * (1.0 + 0.3 * time_bonus)
+                                if sc > best_mtf_score:
+                                    best_mtf_score = sc
+                                    best_mtf_feats = PatternRecognizer.forming_pattern_features(filtered_m15)
+
+                    # H1 scan (4:1 resample of M15) — time-aware: only patterns >= 55% complete
+                    if _resampled_h1 is not None:
+                        h1_cfg = MTF_PAT_CONFIG["H1"]
+                        h1_idx = i // 4  # Which H1 bar corresponds to M15 bar i
+                        h1_end = h1_idx + 1
+                        h1_start = max(0, h1_end - PATTERN_WINDOW)
+                        h1_slice = _resampled_h1.iloc[h1_start:h1_end].copy()
+                        if len(h1_slice) >= 25:
+                            rec_h1 = PatternRecognizer(h1_slice)
+                            forming_h1 = rec_h1.detect_forming_patterns()
+                            if forming_h1:
+                                filtered_h1 = [fp for fp in forming_h1 if fp.completion_pct >= h1_cfg["min_completion"]]
+                                for fp in filtered_h1:
+                                    time_bonus = (fp.completion_pct - h1_cfg["min_completion"]) / (1.0 - h1_cfg["min_completion"] + 1e-8)
+                                    sc = fp.confidence * fp.completion_pct * h1_cfg["weight"] * (1.0 + 0.3 * time_bonus)
+                                    if sc > best_mtf_score:
+                                        best_mtf_score = sc
+                                        best_mtf_feats = PatternRecognizer.forming_pattern_features(filtered_h1)
+
+                    # H4 scan (16:1 resample of M15) — time-aware: only patterns >= 75% complete
+                    if _resampled_h4 is not None:
+                        h4_cfg = MTF_PAT_CONFIG["H4"]
+                        h4_idx = i // 16
+                        h4_end = h4_idx + 1
+                        h4_start = max(0, h4_end - PATTERN_WINDOW)
+                        h4_slice = _resampled_h4.iloc[h4_start:h4_end].copy()
+                        if len(h4_slice) >= 25:
+                            rec_h4 = PatternRecognizer(h4_slice)
+                            forming_h4 = rec_h4.detect_forming_patterns()
+                            if forming_h4:
+                                filtered_h4 = [fp for fp in forming_h4 if fp.completion_pct >= h4_cfg["min_completion"]]
+                                for fp in filtered_h4:
+                                    time_bonus = (fp.completion_pct - h4_cfg["min_completion"]) / (1.0 - h4_cfg["min_completion"] + 1e-8)
+                                    sc = fp.confidence * fp.completion_pct * h4_cfg["weight"] * (1.0 + 0.3 * time_bonus)
+                                    if sc > best_mtf_score:
+                                        best_mtf_score = sc
+                                        best_mtf_feats = PatternRecognizer.forming_pattern_features(filtered_h4)
+
+                    cached_pattern_feats[scan_key] = best_mtf_feats
+                except Exception:
+                    cached_pattern_feats[scan_key] = zero_pattern_feats
+            pattern_features = cached_pattern_feats[scan_key]
+
+            features = np.concatenate([base_features, push_features, pattern_features, one_hot]).astype(np.float32)
 
             future_prices = df.iloc[i:i + horizon]["close"]
             future_return = float(future_prices.iloc[-1] / (current_price + 1e-12) - 1.0)
@@ -887,12 +1058,12 @@ def compute_symbol_profitability_stats(
 
 def build_symbol_live_profile(
     symbol_profitability: Dict[str, Dict[str, float]],
-    min_samples: int = 60,
+    min_samples: int = 20,
     min_profit_factor: float = 1.05,
     min_expectancy: float = 0.00001,
-    min_trade_rate: float = 0.015,
-    min_weekly_prob_positive: float = 0.60,
-    min_weekly_p10_return: float = 0.0,
+    min_trade_rate: float = 0.010,
+    min_weekly_prob_positive: float = 0.55,
+    min_weekly_p10_return: float = -0.04,
 ) -> Dict[str, Dict[str, float]]:
     """
     Build a profitability-first live trading profile per symbol.
@@ -1393,6 +1564,7 @@ def save_model(
     feature_mean: np.ndarray,
     feature_std: np.ndarray,
     metadata: Dict[str, object],
+    push_profiles: Optional[Dict[str, SymbolPushProfile]] = None,
 ) -> None:
     checkpoint = {
         "model_state_dict": model.state_dict(),
@@ -1403,6 +1575,10 @@ def save_model(
         "metadata": metadata,
         "save_date": datetime.now().isoformat(),
     }
+    if push_profiles:
+        checkpoint["push_profiles"] = {
+            k: v.to_dict() for k, v in push_profiles.items()
+        }
     torch.save(checkpoint, model_path)
     print(f"Model saved to {model_path}")
 
@@ -1426,6 +1602,11 @@ def main() -> bool:
         return False
 
     symbol_to_index = build_symbol_index(list(data.keys()))
+
+    # Learn per-symbol push profiles from historical swing structure.
+    print("\nComputing push profiles from MT5 data...")
+    push_profiles = compute_all_push_profiles(data)
+    print(f"Push profiles computed for {len(push_profiles)} symbols")
 
     candidate_configs = [
         {
@@ -1465,6 +1646,7 @@ def main() -> bool:
             symbol_to_index=symbol_to_index,
             lookback=lookback,
             horizon=horizon,
+            push_profiles=push_profiles,
         )
         if len(dataset.features) < 2000:
             print(f"Skipping horizon={horizon} due to insufficient samples")
@@ -1623,12 +1805,12 @@ def main() -> bool:
         weekly_sample_count=float(DEFAULT_WEEKLY_SAMPLES_PER_SYMBOL),
     )
     live_profile_config = {
-        "min_samples": 60,
+        "min_samples": 20,
         "min_profit_factor": 1.05,
         "min_expectancy": 0.00001,
-        "min_trade_rate": 0.015,
-        "min_weekly_prob_positive": 0.60,
-        "min_weekly_p10_return": 0.0,
+        "min_trade_rate": 0.010,
+        "min_weekly_prob_positive": 0.55,
+        "min_weekly_p10_return": -0.04,
     }
     symbol_live_profile = build_symbol_live_profile(
         symbol_profitability=symbol_profitability,
@@ -1693,6 +1875,7 @@ def main() -> bool:
         feature_mean=feature_mean,
         feature_std=feature_std,
         metadata=metadata,
+        push_profiles=push_profiles,
     )
 
     with open("training_report.json", "w", encoding="utf-8") as handle:
