@@ -28,6 +28,8 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 import threading
 
+from push_structure_analyzer import SymbolPushProfile
+
 class SimpleNeuralNetwork(nn.Module):
     """Simple neural network for forex prediction"""
     
@@ -149,7 +151,8 @@ class NeuralModelManager:
         self.symbol_to_index: Dict[str, int] = {}
         self.class_labels: List[str] = ["SELL", "HOLD", "BUY"]
         self.default_trade_threshold = 0.60
-        
+        self.push_profiles: Dict[str, SymbolPushProfile] = {}
+
         # Performance tracking
         self.performance_history = []
         
@@ -371,6 +374,31 @@ class NeuralModelManager:
         self.class_labels = self._normalize_class_labels(
             class_labels, fallback=["SELL", "HOLD", "BUY"]
         )
+
+        # Load push profiles (learned per-symbol push structure from training).
+        self.push_profiles = {}
+        raw_profiles = checkpoint.get("push_profiles") if isinstance(checkpoint, dict) else None
+        if isinstance(raw_profiles, dict):
+            for sym, profile_data in raw_profiles.items():
+                try:
+                    self.push_profiles[sym] = SymbolPushProfile.from_dict(profile_data)
+                except Exception:
+                    pass
+            if self.push_profiles:
+                self.logger.info(f"Loaded push profiles for {len(self.push_profiles)} symbols")
+
+    def get_push_profile(self, symbol: Optional[str]) -> Optional[SymbolPushProfile]:
+        """Get the learned push profile for a symbol, with alias fallback."""
+        if not self.push_profiles:
+            return None
+        if symbol and symbol in self.push_profiles:
+            return self.push_profiles[symbol]
+        # Try normalized aliases.
+        for alias in self._get_symbol_aliases(symbol):
+            for key, profile in self.push_profiles.items():
+                if self._normalize_symbol(key) == alias:
+                    return profile
+        return None
 
     def _load_pickle_checkpoint(self, payload: Any, model_path: Path) -> None:
         """Apply a serialized pickle model package to manager state."""

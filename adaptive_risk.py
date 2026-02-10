@@ -40,12 +40,12 @@ class AdaptiveRiskManager:
         if point <= 0:
             return 0.0
 
-        # Base risk curve by balance.
-        risk_pct = 0.02
+        # Base risk curve by balance — aggressive growth mode.
+        risk_pct = 0.04
         if balance < 1000:
-            risk_pct = 0.04
+            risk_pct = 0.10
         elif balance < 5000:
-            risk_pct = 0.03
+            risk_pct = 0.07
 
         conf = self._normalize_confidence(confidence_score)
         if conf < 0.35:

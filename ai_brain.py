@@ -11,13 +11,19 @@ from pattern_recognition import Pattern, PatternRecognizer
 from trade_validator import TradeDecision, TradeValidator
 from trading_memory import TradingMemory
 
+try:
+    from push_structure_analyzer import SymbolPushProfile
+    _HAS_PUSH_PROFILE = True
+except ImportError:
+    _HAS_PUSH_PROFILE = False
+
 
 class AIBrain:
     """
     Rule-driven trading brain with daily-bias filtering and confluence validation.
     """
 
-    def __init__(self):
+    def __init__(self, push_profiles: Optional[Dict[str, "SymbolPushProfile"]] = None):
         self.market_analyzer = MarketContextAnalyzer()
         self.trade_validator = TradeValidator()
         self.risk_manager = AdaptiveRiskManager()
@@ -25,6 +31,7 @@ class AIBrain:
         self.planner = DailyPlanner()
         self.reasoning_engine = ReasoningEngine()
         self.required_columns = {"open", "high", "low", "close"}
+        self.push_profiles: Dict = push_profiles or {}
 
     def set_daily_plan(self, plan: dict):
         self.planner.set_plan(plan)
@@ -77,13 +84,19 @@ class AIBrain:
         self,
         patterns: List[Tuple[str, Pattern]],
         market_state: Dict,
+        symbol: str = "",
     ) -> Tuple[Optional[str], Optional[Pattern], Optional[TradeDecision]]:
         best_tf = None
         best_pattern = None
         best_decision = None
 
+        # Look up learned push profile for this symbol.
+        push_profile = self.push_profiles.get(symbol) if self.push_profiles else None
+
         for tf, pattern in patterns:
             features = {"vol_anomaly": 1.0 + float(getattr(pattern, "volume_score", 0.5))}
+            if push_profile is not None:
+                features["push_profile"] = push_profile
             decision = self.trade_validator.validate(pattern, market_state, features)
             if not decision.should_trade:
                 continue
@@ -141,7 +154,7 @@ class AIBrain:
         if not filtered:
             return {"decision": "REJECT", "reason": f"Patterns don't match {daily_bias} bias"}
 
-        best_tf, best_pattern, best_decision = self._pick_best_pattern(filtered, market_state)
+        best_tf, best_pattern, best_decision = self._pick_best_pattern(filtered, market_state, symbol)
         if not best_pattern or not best_decision:
             return {"decision": "REJECT", "reason": "All candidate patterns failed validation"}
 

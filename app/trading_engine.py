@@ -34,6 +34,19 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from enhanced_tail_risk_protection import TailRiskProtector
+from push_structure_analyzer import (
+    PushFeatureExtractor,
+    SymbolPushProfile,
+    infer_direction_from_closes,
+)
+from pattern_recognition import PatternRecognizer, Pattern, FormingPattern, FORMING_PATTERN_FEATURE_COUNT
+from .zeropoint_signal import (
+    ZeroPointEngine,
+    ZeroPointSignal,
+    compute_zeropoint_state,
+    extract_zeropoint_bar_features,
+    ZEROPOINT_FEATURES_PER_TF,
+)
 
 class TradingSignal:
     """Trading signal data structure"""
@@ -55,8 +68,8 @@ class TradingSignal:
 
 class Position:
     """Position tracking data structure"""
-    
-    def __init__(self, ticket: int, symbol: str, action: str, 
+
+    def __init__(self, ticket: int, symbol: str, action: str,
                  entry_price: float, stop_loss: float, take_profit: float,
                  position_size: float):
         self.ticket = ticket
@@ -71,13 +84,20 @@ class Position:
         self.unrealized_pnl = 0.0
         self.status = 'OPEN'  # OPEN, CLOSED, PARTIAL
         self.close_recorded = False
+        # Agentic learning metadata (set by _process_signal)
+        self.model_confidence: float = 0.0
+        self.model_action: str = ''
+        self.model_probabilities: str = '{}'
+        self.symbol_threshold: float = 0.0
+        self.action_mode: str = 'normal'
+        self.model_version: str = ''
 
 class TradingEngine:
     """Professional neural trading engine"""
     
     def __init__(self, mt5_connector: MT5Connector, model_manager: NeuralModelManager,
-                 risk_per_trade: float = 0.015, confidence_threshold: float = 0.65,
-                 trading_pairs: List[str] = None, max_concurrent_positions: int = 5):
+                 risk_per_trade: float = 0.08, confidence_threshold: float = 0.65,
+                 trading_pairs: List[str] = None, max_concurrent_positions: int = 8):
         
         self.logger = logging.getLogger(__name__)
         
@@ -96,7 +116,7 @@ class TradingEngine:
         self.performance_tracker = AdvancedPerformanceTracker()
         
         # Trading parameters
-        self.risk_per_trade = risk_per_trade  # 1.5% default
+        self.risk_per_trade = risk_per_trade  # 8% aggressive growth mode
         self.confidence_threshold = confidence_threshold  # 65% default
         self.trading_pairs = trading_pairs or ['EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'BTCUSD']
         self.max_concurrent_positions = max_concurrent_positions
@@ -117,24 +137,50 @@ class TradingEngine:
         self.minimum_symbol_expectancy = 0.00001
         self.minimum_symbol_profitability_samples = 60
         self.live_min_trade_rate = 0.015
+        # Symbols explicitly excluded from live trading (weak model performance).
+        # NOTE: Cleared for ZeroPoint model — EURUSD is now PF 6.84.
+        self.excluded_symbols: set = set()
+        # Correlation groups: symbols in the same group move together.
+        # Sign indicates direction alignment (+1 = long symbol = long group, -1 = inverted).
+        self.correlation_groups = {
+            'USD_COMMODITY': {'AUDUSD': +1, 'NZDUSD': +1, 'USDCAD': -1},
+            'USD_MAJOR': {'EURUSD': +1, 'GBPUSD': +1, 'USDCAD': -1, 'USDJPY': -1},
+            'JPY_CROSSES': {'EURJPY': +1, 'GBPJPY': +1, 'USDJPY': +1},
+        }
+        self.max_correlated_same_direction = 2
+        self.correlated_size_reduction = 0.60
+        # Global lot size cap by account balance (prevents oversizing on tight SLs).
+        self.global_max_lot_table = [
+            (500, 0.10), (1000, 0.20), (3000, 0.50),
+            (5000, 1.00), (10000, 2.00), (50000, 5.00),
+            (float('inf'), 10.00),
+        ]
+        # Progressive daily loss tiers (size reduction as losses accumulate).
+        self._daily_loss_tiers = [
+            (0.05, 0.50),   # 5% daily loss → 50% position size
+            (0.08, 0.25),   # 8% → 25%
+            (0.12, 0.10),   # 12% → 10%
+            (0.15, 0.00),   # 15% → full stop for rest of day
+        ]
+        self._daily_loss_size_factor = 1.0
         self._symbol_live_profile: Dict[str, Dict[str, float]] = {}
         self._symbol_profile_skip_log_time: Dict[str, datetime] = {}
         self.market_closed_cooldown_seconds = 300
         self._symbol_trade_block_until: Dict[str, datetime] = {}
         self._symbol_market_closed_log_time: Dict[str, datetime] = {}
-        self.symbol_entry_cooldown_seconds = 60
-        self.max_new_trades_per_hour = 12
+        self.symbol_entry_cooldown_seconds = 300  # 5 min cooldown between entries on same symbol
+        self.max_new_trades_per_hour = 20
         self._symbol_last_entry_time: Dict[str, datetime] = {}
         self._new_trade_timestamps: List[datetime] = []
         # Tail-risk and intraday protection controls (left-tail avoidance).
         self.tail_risk_control_enabled = False
         self.tail_min_weekly_p10_return = 0.0
         self.tail_min_weekly_prob_positive = 0.60
-        self.max_daily_loss_pct = 0.03
-        self.max_intraday_drawdown_pct = 0.045
-        self.loss_pause_until_next_day = True
-        self.loss_streak_limit = 3
-        self.loss_streak_cooldown_seconds = 1800
+        self.max_daily_loss_pct = 0.15
+        self.max_intraday_drawdown_pct = 0.20
+        self.loss_pause_until_next_day = False
+        self.loss_streak_limit = 5
+        self.loss_streak_cooldown_seconds = 900
         self._symbol_loss_streak: Dict[str, int] = {}
         self._symbol_loss_block_until: Dict[str, datetime] = {}
         self._daily_risk_day: Optional[str] = None
@@ -142,6 +188,9 @@ class TradingEngine:
         self._intraday_peak_equity = 0.0
         self._daily_loss_pause_until: Optional[datetime] = None
         
+        # Agentic orchestrator (set externally after construction)
+        self.orchestrator = None
+
         # Trading state
         self.is_running = False
         self.trading_thread = None
@@ -167,14 +216,41 @@ class TradingEngine:
         self.timeframes = {
             'M5': mt5.TIMEFRAME_M5,
             'M15': mt5.TIMEFRAME_M15,
-            'H1': mt5.TIMEFRAME_H1
+            'H1': mt5.TIMEFRAME_H1,
+            'H4': mt5.TIMEFRAME_H4,
+            'D1': mt5.TIMEFRAME_D1,
         }
         
         # Performance tracking
         self.start_time = None
         self.last_performance_update = None
         
-        self.logger.info("Neural Trading Engine initialized")
+        # ZeroPoint PRO indicator engine (H4 ATR trailing stop strategy)
+        self.zeropoint_engine = ZeroPointEngine()
+        self.zeropoint_enabled = True  # Master toggle
+        self.zeropoint_standalone_size = 0.65  # 65% size for standalone ZP trades
+        self.zeropoint_confluence_boost = 0.10  # Confidence boost when neural + ZP agree
+
+        # ZeroPoint Pure Mode — trades ONLY on ZP H4 flips, fixed lots, no neural/pattern
+        self.zeropoint_pure_mode = False
+        self.zeropoint_fixed_lot = 0.40  # Fixed lot size for pure mode
+        self.zeropoint_skip_symbols: set = set()  # Symbols to skip in ZP pure mode
+
+        # ZeroPoint Trade Monitor settings
+        self.zp_max_loss_dollars = 80.0   # Close if losing more than this dollar amount
+        self.zp_breakeven_pips = 15.0     # Move SL to entry when in profit by this many pips
+        # ZP trailing stop is automatic — re-reads H4 ATR stop each cycle
+
+        # Profit protection timer — log warnings only, don't auto-close
+        # User controls exits via TP editing in the app
+        self.zp_profit_protect_enabled = False
+        self.zp_stall_minutes = 30        # Start watching after this many minutes
+        self.zp_close_deadline_minutes = 60  # Force close by this time if still stalling/fading
+        self.zp_profit_fade_pct = 0.40    # Close if lost 40% of peak profit
+        # Per-position tracking: ticket -> {peak_pnl, peak_time, stall_start}
+        self._zp_position_tracker: Dict[int, Dict[str, Any]] = {}
+
+        self.logger.info("Neural Trading Engine initialized (ZeroPoint PRO enabled)")
     
     def start(self):
         """Start the trading engine"""
@@ -215,10 +291,14 @@ class TradingEngine:
                     "no trades will be executed until symbol quality improves"
                 )
         
+        # Sync existing MT5 positions into internal tracker
+        # This prevents duplicate entries on restart
+        self._sync_mt5_positions()
+
         # Start trading thread
         self.trading_thread = threading.Thread(target=self._trading_loop, daemon=True)
         self.trading_thread.start()
-        
+
         self.logger.info("Neural Trading Engine started")
     
     def stop(self):
@@ -233,7 +313,54 @@ class TradingEngine:
             self.trading_thread.join(timeout=5)
         
         self.logger.info("Neural Trading Engine stopped")
-    
+
+    def _sync_mt5_positions(self):
+        """Load existing MT5 open positions into internal tracker.
+
+        This prevents the engine from opening duplicate trades on symbols
+        that already have open positions from a previous session.
+        """
+        try:
+            import MetaTrader5 as mt5_lib
+            mt5_positions = mt5_lib.positions_get()
+            if not mt5_positions:
+                self.logger.info("MT5 position sync: no open positions found")
+                return
+
+            synced = 0
+            for p in mt5_positions:
+                ticket = p.ticket
+                if ticket in self.positions:
+                    continue  # already tracked
+
+                symbol = p.symbol
+                action = "BUY" if p.type == 0 else "SELL"
+                pos = Position(
+                    ticket=ticket,
+                    symbol=symbol,
+                    action=action,
+                    entry_price=p.price_open,
+                    stop_loss=p.sl,
+                    take_profit=p.tp,
+                    position_size=p.volume,
+                )
+                pos.current_price = p.price_current
+                pos.unrealized_pnl = p.profit
+                pos.status = "OPEN"
+                self.positions[ticket] = pos
+
+                # Mark symbol as recently entered to prevent immediate re-entry
+                sym_key = symbol.upper()
+                self._symbol_last_entry_time[sym_key] = datetime.now()
+                synced += 1
+
+            self.logger.info(
+                f"MT5 position sync: loaded {synced} existing positions "
+                f"({len(self.positions)} total tracked)"
+            )
+        except Exception as e:
+            self.logger.warning(f"MT5 position sync failed: {e}")
+
     def _trading_loop(self):
         """Main trading loop"""
         self.logger.info("Starting trading loop")
@@ -247,17 +374,32 @@ class TradingEngine:
                 self._update_positions()
                 
                 # Generate signals for trading pairs
-                for symbol in self.trading_pairs:
-                    if not self.is_running:
-                        break
-                    
-                    try:
-                        signal = self._generate_signal(symbol)
-                        if signal:
-                            self._process_signal(signal)
-                    except Exception as e:
-                        self.logger.error(f"Error processing {symbol}: {e}")
-                        continue
+                if self.zeropoint_pure_mode:
+                    # ZP Pure Mode: scan ALL symbols, pick best by confidence
+                    best_signal = None
+                    for symbol in self.trading_pairs:
+                        if not self.is_running:
+                            break
+                        try:
+                            signal = self._generate_signal(symbol)
+                            if signal and self._can_trade(signal):
+                                if best_signal is None or signal.confidence > best_signal.confidence:
+                                    best_signal = signal
+                        except Exception as e:
+                            self.logger.error(f"Error processing {symbol}: {e}")
+                    if best_signal:
+                        self._process_signal(best_signal)
+                else:
+                    for symbol in self.trading_pairs:
+                        if not self.is_running:
+                            break
+                        try:
+                            signal = self._generate_signal(symbol)
+                            if signal:
+                                self._process_signal(signal)
+                        except Exception as e:
+                            self.logger.error(f"Error processing {symbol}: {e}")
+                            continue
                 
                 # Update performance metrics
                 if self.last_performance_update is None or \
@@ -614,8 +756,78 @@ class TradingEngine:
                 return entry
         return None
 
+    def _check_correlation_exposure(self, symbol: str, action: str) -> Tuple[bool, float]:
+        """Check if opening a new position would breach correlation exposure limits.
+
+        Checks two things per group:
+          1. Same-direction stacking (e.g. AUDUSD SELL + NZDUSD SELL = both short AUD/NZD, long USD)
+             → reduce size at 1, block at 2
+          2. Conflicting direction (e.g. GBPUSD BUY=short USD + USDCAD BUY=long USD)
+             → block: contradictory fundamental bets on the same underlying
+
+        Returns (allowed, size_factor):
+          - allowed=False means the trade should be blocked
+          - size_factor is a multiplier (1.0 = full size, 0.60 = reduced)
+        """
+        normalized = re.sub(r"[^A-Z0-9]", "", str(symbol or "").upper())
+        action_sign = +1 if action == "BUY" else -1
+        worst_factor = 1.0
+
+        for group_name, members in self.correlation_groups.items():
+            if normalized not in members:
+                continue
+            # Determine the "net direction" this new trade would represent in the group
+            new_net = action_sign * members[normalized]
+
+            # Count existing open positions in this group by net direction
+            same_dir_count = 0
+            opposite_dir_count = 0
+            for pos in self.positions.values():
+                if getattr(pos, 'status', 'OPEN') != 'OPEN':
+                    continue
+                pos_sym = re.sub(r"[^A-Z0-9]", "", str(pos.symbol or "").upper())
+                if pos_sym not in members or pos_sym == normalized:
+                    continue
+                pos_sign = +1 if getattr(pos, 'action', '') == 'BUY' else -1
+                pos_net = pos_sign * members[pos_sym]
+                if pos_net == new_net:
+                    same_dir_count += 1
+                elif pos_net == -new_net:
+                    opposite_dir_count += 1
+
+            # Block contradictory bets — e.g. betting USD up AND down simultaneously
+            if opposite_dir_count >= 1:
+                self.logger.info(
+                    f"Correlation CONFLICT block: {symbol} {action} (net={'long' if new_net > 0 else 'short'}) "
+                    f"contradicts {opposite_dir_count} opposite-direction position(s) in {group_name}"
+                )
+                return (False, 0.0)
+
+            # Block excessive same-direction stacking
+            if same_dir_count >= self.max_correlated_same_direction:
+                self.logger.info(
+                    f"Correlation STACK block: {symbol} {action} would exceed "
+                    f"{self.max_correlated_same_direction} same-direction in {group_name} "
+                    f"(already {same_dir_count} open)"
+                )
+                return (False, 0.0)
+            elif same_dir_count >= 1:
+                worst_factor = min(worst_factor, self.correlated_size_reduction)
+
+        return (True, worst_factor)
+
+    def _get_global_max_lot(self, balance: float) -> float:
+        """Return maximum allowed lot size based on account balance."""
+        for threshold, max_lot in self.global_max_lot_table:
+            if balance < threshold:
+                return max_lot
+        return 5.0
+
     def _is_symbol_live_enabled(self, symbol: str) -> bool:
         """Check if symbol is allowed for live entries by profitability profile."""
+        normalized = re.sub(r"[^A-Z0-9]", "", str(symbol or "").upper())
+        if normalized in self.excluded_symbols or symbol in self.excluded_symbols:
+            return False
         if not self.profitability_first_mode:
             return True
         if not self._symbol_live_profile:
@@ -631,6 +843,10 @@ class TradingEngine:
         if entry is None:
             return 1.0
         if entry.get('enabled', 0.0) < 1.0:
+            # When profitability-first mode is off, disabled symbols still get
+            # a baseline risk multiplier so they can trade immediately.
+            if not self.profitability_first_mode:
+                return 0.50
             return 0.0
         return float(np.clip(float(entry.get('risk_multiplier', 1.0) or 1.0), 0.0, 2.0))
 
@@ -664,6 +880,7 @@ class TradingEngine:
                 self._daily_start_equity = equity
                 self._intraday_peak_equity = equity
                 self._daily_loss_pause_until = None
+                self._daily_loss_size_factor = 1.0
                 self.performance_metrics['daily_pnl'] = 0.0
                 return
 
@@ -686,24 +903,46 @@ class TradingEngine:
                 float(intraday_drawdown),
             )
 
-            hit_daily_loss = daily_loss_ratio >= self.max_daily_loss_pct
-            hit_intraday_dd = intraday_drawdown >= self.max_intraday_drawdown_pct
-            if hit_daily_loss or hit_intraday_dd:
+            # Progressive daily loss tiers — reduce size as losses accumulate
+            prev_factor = self._daily_loss_size_factor
+            new_factor = 1.0
+            for tier_pct, tier_factor in self._daily_loss_tiers:
+                if daily_loss_ratio >= tier_pct:
+                    new_factor = tier_factor
+            self._daily_loss_size_factor = new_factor
+            if new_factor != prev_factor:
+                self.logger.warning(
+                    f"Daily loss tier change: size_factor {prev_factor:.2f} → {new_factor:.2f} "
+                    f"(daily_loss={daily_loss_ratio:.2%})"
+                )
+
+            # Full stop at 15%+ daily loss — pause until next day
+            if daily_loss_ratio >= 0.15:
                 if not self._daily_loss_pause_until or now >= self._daily_loss_pause_until:
-                    if self.loss_pause_until_next_day:
-                        self._daily_loss_pause_until = datetime(
-                            year=now.year,
-                            month=now.month,
-                            day=now.day
-                        ) + timedelta(days=1)
-                    else:
-                        self._daily_loss_pause_until = now + timedelta(hours=2)
+                    self._daily_loss_pause_until = datetime(
+                        year=now.year, month=now.month, day=now.day
+                    ) + timedelta(days=1)
                     self.logger.warning(
-                        "Account risk pause activated: "
-                        f"daily_loss={daily_loss_ratio:.2%}, "
-                        f"intraday_drawdown={intraday_drawdown:.2%}, "
-                        f"paused_until={self._daily_loss_pause_until.strftime('%Y-%m-%d %H:%M:%S')}"
+                        f"FULL STOP: 15%+ daily loss ({daily_loss_ratio:.2%}). "
+                        f"Paused until {self._daily_loss_pause_until.strftime('%Y-%m-%d %H:%M:%S')}"
                     )
+            else:
+                hit_daily_loss = daily_loss_ratio >= self.max_daily_loss_pct
+                hit_intraday_dd = intraday_drawdown >= self.max_intraday_drawdown_pct
+                if hit_daily_loss or hit_intraday_dd:
+                    if not self._daily_loss_pause_until or now >= self._daily_loss_pause_until:
+                        if self.loss_pause_until_next_day:
+                            self._daily_loss_pause_until = datetime(
+                                year=now.year, month=now.month, day=now.day
+                            ) + timedelta(days=1)
+                        else:
+                            self._daily_loss_pause_until = now + timedelta(hours=2)
+                        self.logger.warning(
+                            "Account risk pause activated: "
+                            f"daily_loss={daily_loss_ratio:.2%}, "
+                            f"intraday_drawdown={intraday_drawdown:.2%}, "
+                            f"paused_until={self._daily_loss_pause_until.strftime('%Y-%m-%d %H:%M:%S')}"
+                        )
         except Exception as e:
             self.logger.error(f"Failed to refresh account risk state: {e}")
 
@@ -740,20 +979,215 @@ class TradingEngine:
                     )
             elif pnl > 0.0:
                 self._symbol_loss_streak[symbol_key] = 0
+
+            # Notify agentic orchestrator with full trade context.
+            if self.orchestrator is not None:
+                try:
+                    from trade_journal import TradeRecord
+
+                    entry_val = float(position.entry_price * position.position_size) if position.entry_price else 1.0
+                    record = TradeRecord(
+                        trade_id=f"{position.ticket}_{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                        symbol=symbol_key,
+                        direction=str(position.action or ''),
+                        entry_price=float(position.entry_price or 0.0),
+                        exit_price=float(position.current_price or 0.0),
+                        pnl=pnl,
+                        pnl_pct=pnl / entry_val if entry_val > 0 else 0.0,
+                        model_confidence=float(getattr(position, 'model_confidence', 0.0)),
+                        model_action=str(getattr(position, 'model_action', '')),
+                        model_probabilities=str(getattr(position, 'model_probabilities', '{}')),
+                        symbol_threshold=float(getattr(position, 'symbol_threshold', 0.0)),
+                        action_mode=str(getattr(position, 'action_mode', 'normal')),
+                        entry_time=position.open_time.isoformat() if hasattr(position, 'open_time') else '',
+                        exit_time=datetime.now().isoformat(),
+                        position_size=float(position.position_size or 0.0),
+                        model_version=str(getattr(position, 'model_version', '')),
+                        stop_loss=float(position.stop_loss or 0.0),
+                        take_profit=float(position.take_profit or 0.0),
+                    )
+                    self.orchestrator.notify_trade_closed(record)
+                except Exception as journal_err:
+                    self.logger.debug(f"Trade journal write failed: {journal_err}")
         except Exception as e:
             self.logger.error(f"Failed to register closed position: {e}")
     
+    def _generate_zp_pure_signal(self, symbol: str) -> Optional[TradingSignal]:
+        """Generate signal using ONLY ZeroPoint H4 ATR trailing stop flips.
+
+        Skips neural model, pattern recognition, profitability gates, and all
+        other signal sources.  Used when zeropoint_pure_mode is True.
+        """
+        norm = symbol.upper().replace(".", "").replace("#", "")
+        if norm in self.zeropoint_skip_symbols:
+            return None
+
+        symbol_info = self.mt5_connector.get_symbol_info(symbol)
+        if not symbol_info:
+            return None
+        if not self._is_spread_acceptable(symbol_info):
+            return None
+
+        # Fetch H4 + H1 data
+        h4_rates = self.mt5_connector.get_rates(symbol, mt5.TIMEFRAME_H4, 0, 200)
+        h1_rates = self.mt5_connector.get_rates(symbol, mt5.TIMEFRAME_H1, 0, 200)
+        df_h4 = self._prepare_ohlc_dataframe(h4_rates) if h4_rates else None
+        df_h1 = self._prepare_ohlc_dataframe(h1_rates) if h1_rates else None
+        if df_h4 is None or len(df_h4) < 15:
+            return None
+
+        # Try standard ZP engine; fall back to raw for non-enabled symbols (e.g. EURUSD)
+        zp_signal = None
+        if self.zeropoint_engine.is_symbol_enabled(norm):
+            zp_signal = self.zeropoint_engine.generate_signal(symbol, df_h4, df_h1)
+        if zp_signal is None:
+            zp_signal = self._generate_zp_signal_raw(symbol, df_h4, df_h1)
+        if zp_signal is None:
+            return None
+
+        entry_price = symbol_info['ask'] if zp_signal.direction == 'BUY' else symbol_info['bid']
+        digits = int(symbol_info.get('digits', 5))
+
+        return TradingSignal(
+            symbol=symbol,
+            action=zp_signal.direction,
+            confidence=zp_signal.confidence,
+            entry_price=entry_price,
+            stop_loss=round(zp_signal.stop_loss, digits),
+            take_profit=round(zp_signal.tp1, digits),
+            position_size=self.zeropoint_fixed_lot,
+            reason=(
+                f"ZEROPOINT-PURE {zp_signal.direction} "
+                f"(Tier={zp_signal.tier}, R:R={zp_signal.risk_reward:.1f}, "
+                f"Conf={zp_signal.confidence:.2f})"
+            ),
+        )
+
+    @staticmethod
+    def _generate_zp_signal_raw(symbol, df_h4, df_h1=None):
+        """Generate ZP signal for any symbol (bypasses ZEROPOINT_ENABLED_SYMBOLS).
+
+        Produces a signal whenever ZP has an active position (BULL or BEAR),
+        not just on flip candles.  If the trailing stop is still alive and
+        there's room to TP, it's a valid entry.
+        """
+        zp = compute_zeropoint_state(df_h4)
+        if zp is None or len(zp) < 2:
+            return None
+
+        last = zp.iloc[-1]
+        pos = int(last.get("pos", 0))
+
+        # Must have an active ZP position
+        if pos == 0:
+            return None
+
+        direction = "BUY" if pos == 1 else "SELL"
+
+        # Check how fresh the flip is (for confidence scoring)
+        buy_sig = bool(last.get("buy_signal", False))
+        sell_sig = bool(last.get("sell_signal", False))
+        is_fresh_flip = buy_sig or sell_sig
+        if not is_fresh_flip and len(zp) >= 2:
+            prev = zp.iloc[-2]
+            is_fresh_flip = bool(prev.get("buy_signal", False)) or bool(prev.get("sell_signal", False))
+
+        # Count bars since flip
+        bars_in_pos = 1
+        for idx in range(len(zp) - 2, -1, -1):
+            if int(zp.iloc[idx].get("pos", 0)) == pos:
+                bars_in_pos += 1
+            else:
+                break
+
+        entry = float(last["close"])
+        atr_val = float(last["atr"])
+        if atr_val <= 0 or not np.isfinite(atr_val):
+            return None
+
+        trailing_stop = float(last.get("xATRTrailingStop", 0))
+        if trailing_stop <= 0:
+            return None
+
+        from .zeropoint_signal import (
+            SWING_LOOKBACK, SL_BUFFER_PCT, SL_ATR_MIN_MULT, TP1_MULT,
+        )
+
+        # SL = ZP trailing stop (the actual ATR stop the indicator uses)
+        sl = trailing_stop
+        # Add small buffer beyond the trailing stop
+        buffer = atr_val * SL_BUFFER_PCT
+        if direction == "BUY":
+            sl = sl - buffer
+            tp1 = entry + atr_val * TP1_MULT
+        else:
+            sl = sl + buffer
+            tp1 = entry - atr_val * TP1_MULT
+
+        sl_dist = abs(entry - sl)
+        tp_dist = abs(tp1 - entry)
+        rr = tp_dist / sl_dist if sl_dist > 0 else 0
+
+        # If there's no room left to TP (price already past TP), skip
+        if direction == "BUY" and entry >= tp1:
+            return None
+        if direction == "SELL" and entry <= tp1:
+            return None
+
+        # H1 confirmation
+        h1_conf = False
+        if df_h1 is not None:
+            zp_h1 = compute_zeropoint_state(df_h1)
+            if zp_h1 is not None and len(zp_h1) > 0:
+                h1_pos = int(zp_h1.iloc[-1].get("pos", 0))
+                if direction == "BUY" and h1_pos == 1:
+                    h1_conf = True
+                elif direction == "SELL" and h1_pos == -1:
+                    h1_conf = True
+
+        # Confidence: fresh flips get highest, ongoing positions get moderate
+        if is_fresh_flip:
+            conf = 0.70 + (0.15 if h1_conf else 0.0) + min(rr * 0.05, 0.10)
+        else:
+            # Ongoing position — slightly lower confidence, decays with age
+            age_penalty = min(bars_in_pos * 0.02, 0.15)  # -2% per bar, max -15%
+            conf = 0.65 + (0.12 if h1_conf else 0.0) + min(rr * 0.05, 0.08) - age_penalty
+        conf = max(0.40, min(conf, 0.98))
+
+        # Determine tier based on freshness + H1 alignment
+        if is_fresh_flip and h1_conf:
+            tier = "S"
+        elif is_fresh_flip:
+            tier = "A"
+        elif h1_conf and bars_in_pos <= 5:
+            tier = "B"
+        else:
+            tier = "C"
+
+        return ZeroPointSignal(
+            symbol=symbol, direction=direction, entry_price=entry,
+            stop_loss=sl, tp1=tp1, tp2=tp1, tp3=tp1,
+            atr_value=atr_val, confidence=conf,
+            signal_time=datetime.now(), timeframe="H4",
+            tier=tier, trailing_stop=trailing_stop,
+            risk_reward=rr,
+        )
+
     def _generate_signal(self, symbol: str) -> Optional[TradingSignal]:
         """
         Generate neural trading signal for a symbol
-        
+
         Args:
             symbol: Trading symbol
-            
+
         Returns:
             TradingSignal object or None
         """
         try:
+            # ZeroPoint Pure Mode — skip neural/pattern, only ZP H4 flips
+            if self.zeropoint_pure_mode:
+                return self._generate_zp_pure_signal(symbol)
+
             # Get market data
             market_data = self._get_market_data(symbol)
             if not market_data:
@@ -763,7 +1197,7 @@ class TradingEngine:
             symbol_info = self.mt5_connector.get_symbol_info(symbol)
             if not symbol_info:
                 return None
-            
+
             # Enhanced tail risk protection - analyze market conditions
             try:
                 # Convert market_data to DataFrame for analysis
@@ -856,16 +1290,20 @@ class TradingEngine:
             directional_gap = abs(buy_prob - sell_prob)
             trade_score = float(prediction.get('trade_score', max(buy_prob, sell_prob)) or 0.0)
 
-            if action not in ('BUY', 'SELL'):
-                return self._generate_startup_fallback_signal(symbol, symbol_info, market_data)
+            # Track whether the neural model produced a valid directional signal.
+            # If not, we still allow pattern-only trades downstream.
+            neural_valid = True
 
-            if not should_trade or confidence < required_confidence:
-                return self._generate_startup_fallback_signal(symbol, symbol_info, market_data)
+            if action not in ('BUY', 'SELL'):
+                neural_valid = False
+
+            if neural_valid and (not should_trade or confidence < required_confidence):
+                neural_valid = False
 
             min_trade_score = self.model_min_trade_score
             min_directional_gap = self.model_min_directional_gap
 
-            if (
+            if neural_valid and (
                 trade_score < min_trade_score
                 or directional_gap < min_directional_gap
             ):
@@ -873,64 +1311,365 @@ class TradingEngine:
                     f"Skipping {symbol}: weak model edge "
                     f"(score={trade_score:.3f}, gap={directional_gap:.3f})"
                 )
+                neural_valid = False
+
+            # M15 candle pattern checks & MTF alignment — only when neural
+            # produced a valid directional signal.
+            pattern_description = ""
+            pattern_confirmed = False
+
+            if neural_valid:
+                pattern_action, pattern_rule, pattern_streak = self._get_recent_candle_pattern_signal(
+                    market_data,
+                    timeframe='M15',
+                )
+                if pattern_action in ('BUY', 'SELL'):
+                    if pattern_rule == 'continuation_4plus':
+                        pattern_description = (
+                            f"M15 continuation: {pattern_streak} same-direction candles -> {pattern_action}"
+                        )
+                    elif pattern_rule == 'reversal_3':
+                        pattern_description = (
+                            f"M15 reversal: 3 same-direction candles -> {pattern_action}"
+                        )
+                    else:
+                        pattern_description = f"M15 pattern signal -> {pattern_action}"
+
+                    if self.model_pattern_conflict_block and action != pattern_action:
+                        self.logger.debug(
+                            f"Skipping {symbol}: model={action} conflicts with M15 pattern={pattern_action} "
+                            f"(rule={pattern_rule}, streak={pattern_streak})"
+                        )
+                        return None
+                    if action == pattern_action:
+                        pattern_confirmed = True
+                        confidence = float(np.clip(max(confidence, required_confidence), 0.0, 1.0))
+
+                # Enforce multi-timeframe alignment for live model signals.
+                if self.mtf_alignment_enabled:
+                    mtf_action, mtf_score, _ = self._get_current_mtf_action(market_data)
+                    if mtf_action in ('BUY', 'SELL') and mtf_action != action:
+                        self.logger.debug(
+                            f"Skipping {symbol} model signal {action}: MTF alignment is {mtf_action} (score {mtf_score})"
+                        )
+                        return None
+            
+            # ----------------------------------------------------------
+            # Chart-pattern confluence detection
+            # ----------------------------------------------------------
+            pattern_result = None
+            pattern_sl = None
+            pattern_tp = None
+            pattern_source = ""
+            pattern_size_mult = 1.0   # multiplier for position sizing
+
+            try:
+                pattern_result = self._detect_pattern_signal(symbol, market_data)
+            except Exception as e:
+                self.logger.debug(f"Pattern scan error {symbol}: {e}")
+
+            if neural_valid and pattern_result is not None:
+                pat, pat_tf, pat_score = pattern_result
+                pat_dir = pat.direction.lower()  # "bullish" / "bearish"
+
+                # Map pattern direction to BUY/SELL
+                pat_action = "BUY" if pat_dir == "bullish" else "SELL" if pat_dir == "bearish" else None
+
+                if pat_action is not None:
+                    # Extract pattern-derived SL / TP
+                    pat_sl_raw = pat.details.get("stop_loss")
+                    pat_tp_raw = pat.details.get("target_price")
+
+                    if pat_sl_raw and pat_tp_raw:
+                        pattern_sl = float(pat_sl_raw)
+                        pattern_tp = float(pat_tp_raw)
+
+                    if pat_action == action:
+                        # ---- CONFLUENCE: Neural + Pattern agree ----
+                        confidence = float(np.clip(confidence + 0.05, 0.0, 1.0))
+                        pattern_source = (
+                            f"CONFLUENCE Neural+{pat.name}({pat_tf}, "
+                            f"conf={pat.confidence:.2f}, score={pat_score:.3f})"
+                        )
+                        self.logger.info(
+                            f"{symbol} confluence: neural {action} + {pat.name} on {pat_tf}"
+                        )
+                    else:
+                        # Neural and pattern disagree — ignore pattern for SL/TP
+                        pattern_sl = None
+                        pattern_tp = None
+                        pattern_source = ""
+
+            # ----------------------------------------------------------
+            # Pattern-only trade (neural HOLD / weak / invalid but pattern is strong)
+            # ----------------------------------------------------------
+            if not neural_valid and pattern_result is not None:
+                pat, pat_tf, pat_score = pattern_result
+                pat_dir = pat.direction.lower()
+                pat_action = "BUY" if pat_dir == "bullish" else "SELL" if pat_dir == "bearish" else None
+
+                if (
+                    pat_action is not None
+                    and pat.confidence >= 0.75
+                    and pat.details.get("target_price")
+                    and pat.details.get("stop_loss")
+                ):
+                    pat_entry = symbol_info['ask'] if pat_action == 'BUY' else symbol_info['bid']
+                    _p_sl = float(pat.details["stop_loss"])
+                    _p_tp = float(pat.details["target_price"])
+                    _p_risk = abs(pat_entry - _p_sl)
+                    _p_reward = abs(_p_tp - pat_entry)
+                    _p_rr = _p_reward / _p_risk if _p_risk > 0 else 0.0
+
+                    if _p_rr >= 2.0:
+                        # Override neural HOLD with pattern-only signal at 50 % size
+                        action = pat_action
+                        confidence = float(np.clip(pat.confidence, 0.0, 1.0))
+                        pattern_sl = _p_sl
+                        pattern_tp = _p_tp
+                        pattern_size_mult = 0.50
+                        pattern_source = (
+                            f"PATTERN-ONLY {pat.name}({pat_tf}, "
+                            f"conf={pat.confidence:.2f}, R:R={_p_rr:.1f})"
+                        )
+                        self.logger.info(
+                            f"{symbol} pattern-only trade: {pat.name} on {pat_tf} "
+                            f"(R:R={_p_rr:.1f}, 50%% size)"
+                        )
+
+            # ----------------------------------------------------------
+            # Multi-TF forming pattern detection — AGENTIC approach
+            # The neural model was trained WITH forming-pattern features,
+            # so when it outputs BUY/SELL it already incorporates them.
+            # We scan forming patterns here ONLY to:
+            #   a) Provide structural SL/TP when the model agrees
+            #   b) Boost confidence when neural + forming align
+            #   c) If neural is HOLD, let a very strong forming pattern
+            #      override at reduced size (the model's features still
+            #      feed into this — it just means the model sees something
+            #      forming but doesn't have enough historical confidence yet)
+            # ----------------------------------------------------------
+            forming_result = None
+            try:
+                forming_result = self._detect_forming_pattern_signal(symbol, market_data)
+            except Exception as e:
+                self.logger.debug(f"Forming pattern scan error {symbol}: {e}")
+
+            if forming_result is not None:
+                fp, fp_tf, fp_score = forming_result
+                fp_action = "BUY" if fp.predicted_direction == "bullish" else "SELL"
+                fp_entry = symbol_info['ask'] if fp_action == 'BUY' else symbol_info['bid']
+                fp_risk = abs(fp_entry - fp.stop_loss)
+                fp_reward = abs(fp.target_price - fp_entry)
+                fp_rr = fp_reward / fp_risk if fp_risk > 0 else 0.0
+
+                if neural_valid and action in ('BUY', 'SELL'):
+                    # --- Neural already decided (BUY/SELL) ---
+                    if fp_action == action:
+                        # Neural + forming pattern agree → use structural SL/TP + boost
+                        confidence = float(np.clip(confidence * 1.15, 0.0, 1.0))
+                        if fp_rr >= 1.5:
+                            pattern_sl = fp.stop_loss
+                            pattern_tp = fp.target_price
+                        pattern_source = pattern_source or (
+                            f"NEURAL+FORMING {fp.name}({fp_tf}, "
+                            f"complete={fp.completion_pct:.0%}, R:R={fp_rr:.1f})"
+                        )
+                        self.logger.info(
+                            f"{symbol} neural+forming confluence: {action} + {fp.name} on {fp_tf} "
+                            f"(completion={fp.completion_pct:.0%}, R:R={fp_rr:.1f})"
+                        )
+                    # If they disagree, neural's trained judgment wins — ignore forming pattern
+
+                elif action not in ('BUY', 'SELL'):
+                    # --- Neural said HOLD, but forming pattern detected ---
+                    # Only override if R:R is acceptable — no hardcoded completion/confidence gates.
+                    # The model already saw the forming features and chose HOLD, so we use
+                    # reduced sizing.  The agentic retrainer will learn from these outcomes.
+                    if fp_rr >= 1.5:
+                        action = fp_action
+                        confidence = float(np.clip(fp.confidence * fp.completion_pct, 0.0, 1.0))
+                        pattern_sl = fp.stop_loss
+                        pattern_tp = fp.target_price
+                        # Scale size by completion: more complete = more size (35-65%)
+                        pattern_size_mult = float(np.clip(
+                            0.35 + 0.30 * fp.completion_pct, 0.35, 0.65
+                        ))
+                        pattern_source = (
+                            f"PREDICTIVE {fp.name}({fp_tf}, "
+                            f"complete={fp.completion_pct:.0%}, conf={fp.confidence:.2f}, "
+                            f"R:R={fp_rr:.1f}, size={pattern_size_mult:.0%})"
+                        )
+                        self.logger.info(
+                            f"{symbol} PREDICTIVE trade: {fp.name} on {fp_tf} "
+                            f"(completion={fp.completion_pct:.0%}, R:R={fp_rr:.1f}, "
+                            f"size={pattern_size_mult:.0%})"
+                        )
+
+            # ----------------------------------------------------------
+            # ZeroPoint PRO H4 ATR trailing stop signals
+            # ----------------------------------------------------------
+            # Integration modes:
+            #   1. Neural BUY/SELL + ZeroPoint same direction = CONFLUENCE (boost conf + use ZP SL/TP)
+            #   2. Neural HOLD + ZeroPoint signal = STANDALONE ZP trade at reduced size
+            #   3. Neural vs ZeroPoint disagree = neural wins (ignore ZP)
+            # ----------------------------------------------------------
+            zp_signal = None
+            if self.zeropoint_enabled and self.zeropoint_engine.is_symbol_enabled(symbol):
+                try:
+                    h4_rates = market_data.get('H4')
+                    h1_rates = market_data.get('H1')
+                    df_h4 = self._prepare_ohlc_dataframe(h4_rates) if h4_rates else None
+                    df_h1 = self._prepare_ohlc_dataframe(h1_rates) if h1_rates else None
+
+                    if df_h4 is not None and len(df_h4) >= 15:
+                        zp_signal = self.zeropoint_engine.generate_signal(symbol, df_h4, df_h1)
+                except Exception as e:
+                    self.logger.debug(f"ZeroPoint signal error {symbol}: {e}")
+
+            if zp_signal is not None:
+                if neural_valid and action in ('BUY', 'SELL'):
+                    # Mode 1: CONFLUENCE — neural and ZeroPoint agree
+                    if zp_signal.direction == action:
+                        confidence = float(np.clip(
+                            confidence + self.zeropoint_confluence_boost, 0.0, 1.0
+                        ))
+                        # Use ZeroPoint's structural SL/TP (backtest-validated)
+                        if pattern_sl is None:
+                            pattern_sl = zp_signal.stop_loss
+                            pattern_tp = zp_signal.tp1  # TP1 exit is most profitable
+                        pattern_source = pattern_source or (
+                            f"NEURAL+ZEROPOINT {zp_signal.direction} "
+                            f"(Tier={zp_signal.tier}, R:R={zp_signal.risk_reward:.1f}, "
+                            f"ATR={zp_signal.atr_value:.5f})"
+                        )
+                        self.logger.info(
+                            f"{symbol} NEURAL+ZEROPOINT confluence: {action} "
+                            f"(ZP tier={zp_signal.tier}, R:R={zp_signal.risk_reward:.1f})"
+                        )
+                    # If neural and ZP disagree, neural wins — ignore ZP
+                    else:
+                        self.logger.debug(
+                            f"{symbol} neural={action} vs ZeroPoint={zp_signal.direction} -- neural wins"
+                        )
+
+                elif action not in ('BUY', 'SELL'):
+                    # Mode 2: STANDALONE ZeroPoint trade (neural HOLD)
+                    if zp_signal.risk_reward >= 1.3:
+                        action = zp_signal.direction
+                        confidence = float(np.clip(zp_signal.confidence, 0.0, 1.0))
+                        pattern_sl = zp_signal.stop_loss
+                        pattern_tp = zp_signal.tp1  # Exit at TP1 (backtest-validated)
+                        pattern_size_mult = self.zeropoint_standalone_size
+                        pattern_source = (
+                            f"ZEROPOINT-H4 {zp_signal.direction} "
+                            f"(Tier={zp_signal.tier}, R:R={zp_signal.risk_reward:.1f}, "
+                            f"Conf={zp_signal.confidence:.2f}, ATR={zp_signal.atr_value:.5f}, "
+                            f"size={self.zeropoint_standalone_size:.0%})"
+                        )
+                        self.logger.info(
+                            f"{symbol} ZEROPOINT standalone: {action} "
+                            f"(tier={zp_signal.tier}, R:R={zp_signal.risk_reward:.1f}, "
+                            f"{self.zeropoint_standalone_size:.0%} size)"
+                        )
+
+            # If action is still HOLD after pattern-only + predictive + ZeroPoint checks, fall through
+            if action not in ('BUY', 'SELL'):
                 return self._generate_startup_fallback_signal(symbol, symbol_info, market_data)
 
-            pattern_action, pattern_rule, pattern_streak = self._get_recent_candle_pattern_signal(
-                market_data,
-                timeframe='M15',
-            )
-            pattern_description = ""
-            if pattern_action in ('BUY', 'SELL'):
-                if pattern_rule == 'continuation_4plus':
-                    pattern_description = (
-                        f"M15 continuation: {pattern_streak} same-direction candles -> {pattern_action}"
-                    )
-                elif pattern_rule == 'reversal_3':
-                    pattern_description = (
-                        f"M15 reversal: 3 same-direction candles -> {pattern_action}"
-                    )
-                else:
-                    pattern_description = f"M15 pattern signal -> {pattern_action}"
-            pattern_confirmed = False
-            if pattern_action in ('BUY', 'SELL'):
-                if self.model_pattern_conflict_block and action != pattern_action:
-                    self.logger.debug(
-                        f"Skipping {symbol}: model={action} conflicts with M15 pattern={pattern_action} "
-                        f"(rule={pattern_rule}, streak={pattern_streak})"
-                    )
-                    return None
-                if action == pattern_action:
-                    pattern_confirmed = True
-                    confidence = float(np.clip(max(confidence, required_confidence), 0.0, 1.0))
-
-            # Enforce multi-timeframe alignment for live model signals.
-            if self.mtf_alignment_enabled:
-                mtf_action, mtf_score, _ = self._get_current_mtf_action(market_data)
-                if mtf_action in ('BUY', 'SELL') and mtf_action != action:
-                    self.logger.debug(
-                        f"Skipping {symbol} model signal {action}: MTF alignment is {mtf_action} (score {mtf_score})"
-                    )
-                    return None
-            
-            # Calculate trading parameters
+            # ----------------------------------------------------------
+            # Calculate trading parameters (SL / TP)
+            # ----------------------------------------------------------
             entry_price = symbol_info['ask'] if action == 'BUY' else symbol_info['bid']
-            stop_loss, take_profit = self._calculate_sl_tp(
-                symbol, action, entry_price, symbol_info, market_data
-            )
-            
-            # Enhanced tail risk protection - validate signal
+            digits = int(symbol_info.get('digits', 5))
+
+            if pattern_sl is not None and pattern_tp is not None:
+                # Use pattern-derived structural SL/TP (or ZeroPoint SL/TP)
+                stop_loss = round(pattern_sl, digits)
+                take_profit = round(pattern_tp, digits)
+            else:
+                # Fallback: ATR-based SL/TP
+                stop_loss, take_profit = self._calculate_sl_tp(
+                    symbol, action, entry_price, symbol_info, market_data
+                )
+
+            # ----------------------------------------------------------
+            # R:R ≥ 2.0 filter (pattern-based trades only)
+            # ----------------------------------------------------------
+            if pattern_sl is not None and pattern_tp is not None:
+                risk_dist = abs(entry_price - stop_loss)
+                reward_dist = abs(take_profit - entry_price)
+                rr_ratio = reward_dist / risk_dist if risk_dist > 0 else 0.0
+                if rr_ratio < 2.0:
+                    self.logger.debug(
+                        f"Skipping {symbol}: pattern R:R too low ({rr_ratio:.2f} < 2.0)"
+                    )
+                    return None
+
+            # ----------------------------------------------------------
+            # Candle close confirmation (pattern-based trades)
+            # ----------------------------------------------------------
+            if pattern_result is not None and pattern_sl is not None:
+                pat, pat_tf, _ = pattern_result
+                try:
+                    tf_rates = market_data.get(pat_tf)
+                    if tf_rates:
+                        df_check = self._prepare_ohlc_dataframe(tf_rates)
+                        if df_check is not None:
+                            # Pattern breakout candle must be a CLOSED candle.
+                            # MT5 get_rates returns *completed* candles, so index
+                            # len(df)-1 is the last completed candle.  If the
+                            # pattern's breakout index equals that last candle we
+                            # accept it; if index_end == len(df) (would be
+                            # current live candle), we wait.
+                            last_closed_idx = len(df_check) - 1
+                            if pat.index_end > last_closed_idx:
+                                self.logger.debug(
+                                    f"Skipping {symbol}: pattern breakout candle not yet closed "
+                                    f"on {pat_tf}"
+                                )
+                                return None
+                except Exception as e:
+                    self.logger.debug(f"Candle-close check error {symbol}: {e}")
+
+            # ----------------------------------------------------------
+            # Retest detection — boost confidence if retest confirmed
+            # ----------------------------------------------------------
+            if pattern_result is not None and pattern_sl is not None:
+                pat, pat_tf, _ = pattern_result
+                try:
+                    tf_rates = market_data.get(pat_tf)
+                    if tf_rates:
+                        df_retest = self._prepare_ohlc_dataframe(tf_rates)
+                        if df_retest is not None and len(df_retest) > 0:
+                            current_close = float(df_retest['close'].iloc[-1])
+                            retest_ok = PatternRecognizer.detect_retest(pat, current_close)
+                            if retest_ok:
+                                confidence = float(np.clip(confidence + 0.05, 0.0, 1.0))
+                                pattern_source += " [retest confirmed]"
+                                self.logger.info(
+                                    f"{symbol} retest confirmed for {pat.name}"
+                                )
+                            else:
+                                # No retest — reduce position size by 25 %
+                                pattern_size_mult *= 0.75
+                except Exception as e:
+                    self.logger.debug(f"Retest check error {symbol}: {e}")
+
+            # ----------------------------------------------------------
+            # Enhanced tail risk protection — validate signal
+            # ----------------------------------------------------------
             if self.tail_risk_control_enabled:
                 try:
-                    # Get recent performance history for validation
-                    recent_performance = [trade.get('pnl', 0.0) for trade in 
+                    recent_performance = [trade.get('pnl', 0.0) for trade in
                                         self.performance_metrics.get('recent_trades', [])[-10:]]
-                    
+
                     validation_result = self.tail_risk_protector.validate_trade_signal(
                         signal_confidence=confidence,
                         market_conditions=market_conditions,
                         recent_performance=recent_performance
                     )
-                    
+
                     if not validation_result['approved']:
                         rejection_reasons = '; '.join(validation_result['rejection_reasons'])
                         self.logger.debug(
@@ -938,39 +1677,67 @@ class TradingEngine:
                         )
                         if not self.immediate_trade_mode:
                             return None
-                    # Apply risk scaling from validation
                     risk_multiplier *= float(validation_result.get('position_size_multiplier', 1.0) or 1.0)
-                    
+
                 except Exception as e:
                     self.logger.warning(f"Tail risk validation failed for {symbol}: {e}")
-                    # Continue without tail risk protection in case of error
-            
-            # Calculate position size with enhanced tail risk protection
-            account_info = self.mt5_connector.get_account_info()
-            base_position_size = self._calculate_position_size(
+
+            # ----------------------------------------------------------
+            # UNIFIED position sizing pipeline — single multiplier, hard-capped
+            # ----------------------------------------------------------
+            # risk_multiplier already includes symbol profile + tail risk
+            effective_mult = risk_multiplier
+            effective_mult *= min(pattern_size_mult, 1.25)       # cap pattern bonus
+
+            # Correlation-based size reduction
+            _, corr_factor = self._check_correlation_exposure(symbol, action)
+            effective_mult *= corr_factor
+
+            # Progressive daily loss reduction
+            effective_mult *= self._daily_loss_size_factor
+
+            # HARD CAP — no compound stacking beyond 1.5x
+            effective_mult = min(effective_mult, 1.5)
+
+            self.logger.debug(
+                f"{symbol} sizing pipeline: risk_mult={risk_multiplier:.2f}, "
+                f"pat_mult={pattern_size_mult:.2f}→{min(pattern_size_mult, 1.25):.2f}, "
+                f"corr={corr_factor:.2f}, daily_loss={self._daily_loss_size_factor:.2f}, "
+                f"effective={effective_mult:.2f}"
+            )
+
+            position_size = self._calculate_position_size(
                 symbol,
                 entry_price,
                 stop_loss,
                 symbol_info,
-                risk_multiplier=risk_multiplier,
+                risk_multiplier=effective_mult,
             )
-            
-            if base_position_size <= 0:
+
+            if position_size <= 0:
                 return None
-            
-            # Apply dynamic position sizing from tail risk protector
-            try:
-                enhanced_position_size = self.tail_risk_protector.calculate_dynamic_position_size(
-                    base_lot_size=base_position_size,
-                    confidence=confidence,
-                    market_conditions=market_conditions,
-                    account_balance=account_info.get('balance', 10000.0) if account_info else 10000.0
+
+            # ----------------------------------------------------------
+            # Build reason string
+            # ----------------------------------------------------------
+            if pattern_source:
+                reason = (
+                    f"{pattern_source} | {action} "
+                    f"({confidence:.1%} confidence)"
                 )
-                position_size = enhanced_position_size
-            except Exception as e:
-                self.logger.warning(f"Dynamic position sizing failed for {symbol}: {e}")
-                position_size = base_position_size
-            
+            elif pattern_confirmed:
+                reason = (
+                    f"Neural + M15 candle confirmation: {action} "
+                    f"({confidence:.1%} confidence, threshold {required_confidence:.1%})"
+                    + (f" | {pattern_description}" if pattern_description else "")
+                )
+            else:
+                reason = (
+                    f"Neural prediction: {action} "
+                    f"({confidence:.1%} confidence, threshold {required_confidence:.1%})"
+                    + (f" | {pattern_description}" if pattern_description else "")
+                )
+
             # Create signal
             signal = TradingSignal(
                 symbol=symbol,
@@ -980,20 +1747,9 @@ class TradingEngine:
                 stop_loss=stop_loss,
                 take_profit=take_profit,
                 position_size=position_size,
-                reason=(
-                    (
-                        f"Neural + pattern confirmation: {action} "
-                        f"({confidence:.1%} confidence, threshold {required_confidence:.1%})"
-                        if pattern_confirmed
-                        else (
-                            f"Neural prediction: {action} "
-                            f"({confidence:.1%} confidence, threshold {required_confidence:.1%})"
-                        )
-                    )
-                    + (f" | {pattern_description}" if pattern_description else "")
-                )
+                reason=reason,
             )
-            
+
             return signal
             
         except Exception as e:
@@ -1029,26 +1785,36 @@ class TradingEngine:
             return None
     
     def _get_market_data(self, symbol: str) -> Optional[Dict[str, Any]]:
-        """Get comprehensive market data for a symbol"""
+        """Get comprehensive market data for a symbol.
+
+        Core timeframes (M5, M15, H1) are mandatory — if any is missing the
+        method returns None.  Higher timeframes (H4, D1) are optional and used
+        only for chart-pattern detection; their absence is tolerated.
+        """
+        CORE_TIMEFRAMES = {"M5", "M15", "H1"}
         try:
             market_data = {}
-            
-            # Get data for multiple timeframes
+
             for tf_name, tf_constant in self.timeframes.items():
                 rates = self.mt5_connector.get_rates(symbol, tf_constant, 0, 100)
                 if rates:
                     market_data[tf_name] = rates
                 else:
-                    self.logger.warning(f"No {tf_name} data for {symbol}")
-                    return None
-            
+                    if tf_name in CORE_TIMEFRAMES:
+                        self.logger.warning(f"No {tf_name} data for {symbol}")
+                        return None
+                    else:
+                        # H4 / D1 missing is non-fatal — pattern detection
+                        # will simply skip that timeframe.
+                        self.logger.debug(f"No {tf_name} data for {symbol} (optional)")
+
             # Get symbol info
             symbol_info = self.mt5_connector.get_symbol_info(symbol)
             if symbol_info:
                 market_data['symbol_info'] = symbol_info
-            
+
             return market_data
-            
+
         except Exception as e:
             self.logger.error(f"Error getting market data for {symbol}: {e}")
             return None
@@ -1349,10 +2115,49 @@ class TradingEngine:
             self.logger.error(f"Error building historical MTF startup signal for {symbol}: {e}")
             return None
 
+    def _compute_zeropoint_tf_features(self, ohlcv_data) -> np.ndarray:
+        """
+        Compute 5 ZeroPoint features from one timeframe's OHLCV data.
+
+        Args:
+            ohlcv_data: Raw MT5 rates (list of dicts) or pandas DataFrame
+
+        Returns:
+            np.ndarray of shape (5,) with ZeroPoint features, or zeros on error.
+        """
+        zero = np.zeros(ZEROPOINT_FEATURES_PER_TF, dtype=np.float32)
+        try:
+            if ohlcv_data is None:
+                return zero
+
+            # Convert to DataFrame if needed
+            if isinstance(ohlcv_data, pd.DataFrame):
+                df = ohlcv_data
+            else:
+                df = self._prepare_ohlc_dataframe(ohlcv_data)
+
+            if df is None or len(df) < 15:
+                return zero
+
+            # Compute ZeroPoint state
+            zp_df = compute_zeropoint_state(df)
+            if zp_df is None or len(zp_df) == 0:
+                return zero
+
+            # Extract features from the last bar
+            return extract_zeropoint_bar_features(zp_df.iloc[-1])
+        except Exception as e:
+            self.logger.debug(f"ZeroPoint TF feature error: {e}")
+            return zero
+
     def _extract_features(self, symbol: str, market_data: Dict[str, Any]) -> Optional[np.ndarray]:
         """
         Extract runtime features aligned with trainer feature schema.
         Base feature order mirrors `simple_neural_trainer.py`.
+
+        Backwards-compatible: If model has zeropoint_feature_count > 0 in metadata,
+        15 ZeroPoint features (5 per TF x M15/H1/H4) are inserted between
+        forming pattern features and symbol one-hot. Otherwise, same 47-dim vector.
         """
         try:
             if 'M15' not in market_data:
@@ -1395,6 +2200,14 @@ class TradingEngine:
             volume_z = float(current['volume_z']) if np.isfinite(current['volume_z']) else 0.0
             body_ratio = float(current['body_ratio']) if np.isfinite(current['body_ratio']) else 0.0
 
+            # Spread features (indices 16-17, matching trainer).
+            symbol_info = self.mt5_connector.get_symbol_info(symbol) if hasattr(self, 'mt5_connector') else None
+            symbol_point = float(getattr(symbol_info, 'point', 0.0001)) if symbol_info else 0.0001
+            spread_points = float(getattr(symbol_info, 'spread', 0.0) if symbol_info else 0.0)
+            spread_cost = float(np.clip((spread_points * symbol_point) / (current_price + 1e-12), 0.0, 0.02))
+            atr_ratio = atr_14 / (current_price + 1e-12)
+            spread_pressure = spread_cost / (atr_ratio + 1e-12)
+
             base_features = np.array(
                 [
                     (current_price - prev_price) / (prev_price + 1e-12),
@@ -1413,12 +2226,127 @@ class TradingEngine:
                     bb_pos,
                     volume_z,
                     body_ratio,
+                    spread_cost,
+                    spread_pressure,
                 ],
                 dtype=np.float32,
             )
 
+            # Push structure features (8 features from swing analysis).
+            push_profile = self.model_manager.get_push_profile(symbol)
+            if push_profile is None:
+                push_profile = SymbolPushProfile.default(symbol)
+            push_window = max(60, len(df))
+            pw_start = max(0, len(df) - push_window)
+            pw_highs = df['high'].astype(float).values[pw_start:]
+            pw_lows = df['low'].astype(float).values[pw_start:]
+            pw_closes = df['close'].astype(float).values[pw_start:]
+            direction = infer_direction_from_closes(pw_closes, lookback=10)
+            push_features = PushFeatureExtractor.extract_push_features(
+                highs=pw_highs,
+                lows=pw_lows,
+                closes=pw_closes,
+                profile=push_profile,
+                point=symbol_point,
+                direction=direction,
+            )
+
+            # Forming pattern features (12 features — puzzle-piece detection).
+            # Scan ALL timeframes (M15, H1, H4, D1) for forming patterns and
+            # pick the strongest one.  This makes the neural model multi-TF aware
+            # so it can decide to trade immediately when it sees a strong forming
+            # structure on any timeframe.
+            # TIME-AWARE: Only feed patterns likely to resolve within our ~24hr
+            # profit window.  Higher TFs need higher completion to qualify.
+            try:
+                MTF_PAT_CONFIG = {
+                    "M15": {"weight": 0.85, "min_completion": 0.40},
+                    "H1":  {"weight": 1.0,  "min_completion": 0.55},
+                    "H4":  {"weight": 1.15, "min_completion": 0.75},
+                    "D1":  {"weight": 1.3,  "min_completion": 0.90},
+                }
+                best_forming_score = -1.0
+                best_forming_feats = np.zeros(FORMING_PATTERN_FEATURE_COUNT, dtype=np.float32)
+
+                for pat_tf, cfg in MTF_PAT_CONFIG.items():
+                    try:
+                        if pat_tf == "M15":
+                            # Already have enriched M15 df
+                            pat_df = df
+                        else:
+                            pat_rates = market_data.get(pat_tf)
+                            if not pat_rates:
+                                continue
+                            pat_df_raw = self._prepare_ohlc_dataframe(pat_rates)
+                            if pat_df_raw is None or len(pat_df_raw) < 30:
+                                continue
+                            pat_df = pat_df_raw  # No need to enrich; PatternRecognizer uses OHLCV
+
+                        pat_window = min(80, len(pat_df))
+                        pat_slice = pat_df.iloc[-pat_window:].copy()
+                        if len(pat_slice) < 25:
+                            continue
+
+                        recognizer = PatternRecognizer(pat_slice)
+                        forming = recognizer.detect_forming_patterns()
+                        if not forming:
+                            continue
+
+                        min_comp = cfg["min_completion"]
+                        tf_weight = cfg["weight"]
+
+                        # Filter: only keep patterns that meet time-aware completion threshold
+                        time_filtered = [fp for fp in forming if fp.completion_pct >= min_comp]
+                        if not time_filtered:
+                            continue
+
+                        # Score: best pattern's confidence * completion * TF weight + time bonus
+                        for fp in time_filtered:
+                            time_bonus = (fp.completion_pct - min_comp) / (1.0 - min_comp + 1e-8)
+                            fp_score = fp.confidence * fp.completion_pct * tf_weight * (1.0 + 0.3 * time_bonus)
+                            if fp_score > best_forming_score:
+                                best_forming_score = fp_score
+                                best_forming_feats = PatternRecognizer.forming_pattern_features(time_filtered)
+                    except Exception:
+                        continue
+
+                pattern_features = best_forming_feats
+            except Exception:
+                pattern_features = np.zeros(FORMING_PATTERN_FEATURE_COUNT, dtype=np.float32)
+
             symbol_features = self.model_manager.get_symbol_features(symbol)
-            features = np.concatenate([base_features, symbol_features]).astype(np.float32)
+
+            # Check if model expects ZeroPoint features (backwards-compatible)
+            zp_feature_count = 0
+            if hasattr(self, 'model_manager') and self.model_manager is not None:
+                model_meta = getattr(self.model_manager, 'metadata', None) or {}
+                zp_feature_count = int(model_meta.get("zeropoint_feature_count", 0))
+
+            if zp_feature_count > 0:
+                # Model was trained with ZeroPoint features — compute 15 ZP features
+                # (5 per timeframe x M15/H1/H4)
+                zp_m15_feats = self._compute_zeropoint_tf_features(df_raw)
+                zp_h1_feats = self._compute_zeropoint_tf_features(market_data.get('H1'))
+                zp_h4_feats = self._compute_zeropoint_tf_features(market_data.get('H4'))
+
+                features = np.concatenate([
+                    base_features,       # 18
+                    push_features,       # 8
+                    pattern_features,    # 12
+                    zp_m15_feats,        # 5
+                    zp_h1_feats,         # 5
+                    zp_h4_feats,         # 5
+                    symbol_features,     # 9
+                ]).astype(np.float32)
+            else:
+                # Old model (47 dims) — no ZeroPoint features
+                features = np.concatenate([
+                    base_features,
+                    push_features,
+                    pattern_features,
+                    symbol_features,
+                ]).astype(np.float32)
+
             return features
         except Exception as e:
             self.logger.error(f"Error extracting features: {e}")
@@ -1488,7 +2416,126 @@ class TradingEngine:
         except Exception as e:
             self.logger.error(f"Error calculating SL/TP for {symbol}: {e}")
             return 0.0, 0.0
-    
+
+    # ------------------------------------------------------------------ #
+    # Chart pattern detection + confluence                                #
+    # ------------------------------------------------------------------ #
+
+    def _detect_pattern_signal(self, symbol: str, market_data: Dict[str, Any]) -> Optional[Tuple[Pattern, str, float]]:
+        """Scan H1/H4/D1 for fresh chart patterns.
+
+        Returns ``(best_pattern, timeframe_key, pattern_score)`` or None.
+        """
+        TF_WEIGHTS = {"H1": 1.0, "H4": 1.15, "D1": 1.3}
+        # Max pattern age varies by timeframe (higher TF patterns take longer
+        # to play out their measured moves).
+        TF_MAX_AGE = {"H1": 5, "H4": 10, "D1": 20}
+        best: Optional[Tuple[Pattern, str, float]] = None
+
+        for tf_key, tf_weight in TF_WEIGHTS.items():
+            rates = market_data.get(tf_key)
+            if not rates:
+                continue
+            df = self._prepare_ohlc_dataframe(rates)
+            if df is None or len(df) < 45:
+                continue
+            max_age = TF_MAX_AGE.get(tf_key, 10)
+            try:
+                recognizer = PatternRecognizer(df)
+                patterns = recognizer.detect_all(max_age=max_age)
+            except Exception as e:
+                self.logger.debug(f"Pattern detection error on {symbol} {tf_key}: {e}")
+                continue
+
+            for pat in patterns:
+                # Must have a valid target_price (should always be true
+                # after _validate_and_filter but guard anyway)
+                if not pat.details.get("target_price"):
+                    continue
+                # Score = confidence * volume boost * timeframe weight
+                score = pat.confidence * (1.0 + 0.2 * pat.volume_score) * tf_weight
+                if best is None or score > best[2]:
+                    best = (pat, tf_key, score)
+
+        if best is not None:
+            pat, tf, sc = best
+            self.logger.info(
+                f"Pattern detected for {symbol}: {pat.name} on {tf} "
+                f"(conf={pat.confidence:.2f}, score={sc:.3f}, dir={pat.direction})"
+            )
+        return best
+
+    def _detect_forming_pattern_signal(
+        self, symbol: str, market_data: Dict[str, Any],
+    ) -> Optional[Tuple[FormingPattern, str, float]]:
+        """Scan H1/H4/D1 for FORMING (incomplete) patterns — the 'puzzle pieces'.
+
+        TIME-AWARE: Only considers patterns likely to resolve within our
+        profit window (~24 hours).  Higher TF patterns need higher completion
+        to qualify because they take longer to play out:
+          - M15: >=40% complete (resolves in hours)
+          - H1:  >=55% complete (resolves in hours–1 day)
+          - H4:  >=75% complete (resolves in 1–3 days, need near-apex)
+          - D1:  >=90% complete (resolves in days–weeks, only if imminent)
+
+        Returns ``(best_forming, timeframe_key, score)`` or None.
+        """
+        # Timeframe weights + minimum completion to be time-actionable.
+        # Higher TF patterns are more powerful BUT only if they'll resolve
+        # within our ~24hr profit window.
+        TF_CONFIG = {
+            "M15": {"weight": 0.85, "min_completion": 0.40},
+            "H1":  {"weight": 1.0,  "min_completion": 0.55},
+            "H4":  {"weight": 1.15, "min_completion": 0.75},
+            "D1":  {"weight": 1.3,  "min_completion": 0.90},
+        }
+        best: Optional[Tuple[FormingPattern, str, float]] = None
+
+        for tf_key, cfg in TF_CONFIG.items():
+            rates = market_data.get(tf_key)
+            if not rates:
+                continue
+            df = self._prepare_ohlc_dataframe(rates)
+            if df is None or len(df) < 30:
+                continue
+            try:
+                recognizer = PatternRecognizer(df)
+                forming = recognizer.detect_forming_patterns()
+            except Exception as e:
+                self.logger.debug(f"Forming pattern error on {symbol} {tf_key}: {e}")
+                continue
+
+            min_comp = cfg["min_completion"]
+            tf_weight = cfg["weight"]
+
+            for fp in forming:
+                # TIME GATE: pattern must be complete enough for this TF
+                # to resolve within our profit window
+                if fp.completion_pct < min_comp:
+                    continue
+                # Must have valid R:R
+                entry_est = fp.breakout_level
+                risk = abs(entry_est - fp.stop_loss)
+                reward = abs(fp.target_price - entry_est)
+                if risk <= 0 or reward / risk < 1.5:
+                    continue
+
+                # Time-adjusted score: bonus for patterns near completion
+                # on faster timeframes (more likely to resolve in our window)
+                time_bonus = (fp.completion_pct - min_comp) / (1.0 - min_comp + 1e-8)
+                score = fp.confidence * fp.completion_pct * tf_weight * (1.0 + 0.3 * time_bonus)
+                if best is None or score > best[2]:
+                    best = (fp, tf_key, score)
+
+        if best is not None:
+            fp, tf, sc = best
+            self.logger.info(
+                f"FORMING pattern for {symbol}: {fp.name} on {tf} "
+                f"(completion={fp.completion_pct:.0%}, conf={fp.confidence:.2f}, "
+                f"score={sc:.3f}, dir={fp.predicted_direction})"
+            )
+        return best
+
     def _calculate_position_size(self, symbol: str, entry_price: float, stop_loss: float,
                                symbol_info: Dict[str, Any], risk_multiplier: float = 1.0) -> float:
         """Calculate position size based on risk management"""
@@ -1537,7 +2584,17 @@ class TradingEngine:
             
             # Ensure within limits
             position_size = max(volume_min, min(volume_max, position_size))
-            
+
+            # Global balance-based lot cap — prevents oversized positions
+            # on small accounts regardless of SL tightness
+            global_max = self._get_global_max_lot(balance)
+            if position_size > global_max:
+                self.logger.info(
+                    f"Global lot cap: {position_size:.2f} -> {global_max:.2f} "
+                    f"(balance=${balance:.0f})"
+                )
+                position_size = global_max
+
             return float(round(position_size, 2))
             
         except Exception as e:
@@ -1704,6 +2761,22 @@ class TradingEngine:
                     position_size=signal.position_size
                 )
                 
+                # Attach model context for agentic learning journal.
+                position.model_confidence = float(signal.confidence or 0.0)
+                position.model_action = str(signal.action or '')
+                try:
+                    _threshold = self._resolve_symbol_trade_threshold(signal.symbol)
+                    position.symbol_threshold = float(_threshold)
+                except Exception:
+                    position.symbol_threshold = 0.0
+                try:
+                    _metadata = getattr(self.model_manager, 'model_metadata', {}) or {}
+                    _action_modes = _metadata.get('symbol_action_modes', {}) or {}
+                    position.action_mode = str(_action_modes.get(signal.symbol.upper(), 'normal'))
+                    position.model_version = str(_metadata.get('training_date', ''))
+                except Exception:
+                    pass
+
                 self.positions[position.ticket] = position
                 self.signals_history.append(signal)
                 self._symbol_last_entry_time[signal.symbol.upper()] = now
@@ -1771,11 +2844,29 @@ class TradingEngine:
         if len(self.positions) >= self.max_concurrent_positions:
             return False
         
-        # Check if we already have a position in this symbol
+        # Check if we already have a position in this symbol (internal tracker)
         for position in self.positions.values():
             if position.symbol == signal.symbol and position.status == 'OPEN':
                 return False
-        
+
+        # SAFETY NET: also check MT5 directly for existing positions on this symbol.
+        # This catches positions from previous sessions that may not be in our tracker.
+        try:
+            import MetaTrader5 as mt5_lib
+            mt5_sym_positions = mt5_lib.positions_get(symbol=signal.symbol)
+            if mt5_sym_positions and len(mt5_sym_positions) > 0:
+                self.logger.info(
+                    f"MT5 duplicate guard: {signal.symbol} already has "
+                    f"{len(mt5_sym_positions)} open position(s) on MT5 - blocking new entry"
+                )
+                return False
+        except Exception:
+            pass  # If MT5 query fails, rely on internal tracker
+
+        # ZeroPoint Pure Mode — bypass confidence threshold and correlation guard
+        if self.zeropoint_pure_mode:
+            return True
+
         # Check confidence using symbol-level threshold when available.
         reason_text = str(getattr(signal, 'reason', '') or '').lower()
         symbol_threshold = self._resolve_symbol_trade_threshold(signal.symbol)
@@ -1791,9 +2882,16 @@ class TradingEngine:
 
         if signal.confidence < required_confidence:
             return False
-        
-        # Additional risk checks can be added here
-        
+
+        # Correlation exposure guard — block if too many same-direction correlated positions
+        corr_allowed, _ = self._check_correlation_exposure(signal.symbol, signal.action)
+        if not corr_allowed:
+            self.logger.info(
+                f"Correlation guard blocked {signal.symbol} {signal.action}: "
+                f"too many same-direction correlated positions"
+            )
+            return False
+
         return True
     
     def _execute_trade(self, signal: TradingSignal) -> Optional[Dict[str, Any]]:
@@ -1876,12 +2974,310 @@ class TradingEngine:
             self.logger.error(f"Error executing trade: {e}")
             return None
     
+    # ------------------------------------------------------------------
+    # ZeroPoint Trade Monitor — active position management
+    # ------------------------------------------------------------------
+    # 1. Trail SL using live ZeroPoint ATR trailing stop
+    # 2. Max loss cutoff — close if losing more than threshold
+    # 3. Break-even move — move SL to entry once in profit by threshold
+    # ------------------------------------------------------------------
+
+    def _zp_manage_positions(self):
+        """Active management for open ZP positions.
+
+        Called every trading loop cycle.  Updates SL via ZP trailing stop,
+        enforces max-loss cutoff, and moves to break-even when in profit.
+        """
+        if not self.zeropoint_pure_mode:
+            return
+
+        import MetaTrader5 as mt5_lib
+        mt5_positions = mt5_lib.positions_get()
+        if not mt5_positions:
+            # No open positions — clear tracker
+            self._zp_position_tracker.clear()
+            return
+
+        # Clean up tracker for positions that no longer exist
+        open_tickets = {p.ticket for p in mt5_positions}
+        stale = [t for t in self._zp_position_tracker if t not in open_tickets]
+        for t in stale:
+            self._zp_position_tracker.pop(t, None)
+
+        for pos in mt5_positions:
+            try:
+                self._zp_manage_single_position(pos)
+            except Exception as e:
+                self.logger.debug(f"ZP manage error {pos.symbol}: {e}")
+
+    def _zp_manage_single_position(self, mt5_pos):
+        """Manage a single open position with ZP trailing stop + safety cutoffs."""
+        import MetaTrader5 as mt5_lib
+
+        symbol = mt5_pos.symbol
+        ticket = mt5_pos.ticket
+        action = "BUY" if mt5_pos.type == 0 else "SELL"
+        entry = mt5_pos.price_open
+        current_sl = mt5_pos.sl
+        current_tp = mt5_pos.tp
+        current_price = mt5_pos.price_current
+        pnl = mt5_pos.profit
+        volume = mt5_pos.volume
+
+        # --- 1. MAX LOSS CUTOFF ---
+        if pnl <= -self.zp_max_loss_dollars:
+            self.logger.warning(
+                f"ZP MAX LOSS cutoff: {symbol} {action} losing ${abs(pnl):.2f} "
+                f"(threshold ${self.zp_max_loss_dollars:.2f}) — CLOSING"
+            )
+            self._mt5_close_position(ticket, symbol, action, volume)
+            self._zp_position_tracker.pop(ticket, None)
+            return
+
+        # --- 2. PROFIT PROTECTION TIMER ---
+        # Track peak P/L per position. If the trade was profitable but is now
+        # stalling or fading, close within 30-60 min to lock in gains.
+        now = datetime.now()
+        tracker = self._zp_position_tracker.get(ticket)
+        if tracker is None:
+            tracker = {
+                "peak_pnl": pnl,
+                "peak_time": now,
+                "stall_start": None,
+                "open_time": now,
+            }
+            self._zp_position_tracker[ticket] = tracker
+
+        # Update peak P/L
+        if pnl > tracker["peak_pnl"]:
+            tracker["peak_pnl"] = pnl
+            tracker["peak_time"] = now
+            tracker["stall_start"] = None  # Reset stall timer — still making new highs
+
+        if self.zp_profit_protect_enabled and tracker["peak_pnl"] > 0:
+            peak = tracker["peak_pnl"]
+            age_minutes = (now - tracker["open_time"]).total_seconds() / 60.0
+
+            # How much of the peak profit has been given back?
+            if peak > 0:
+                fade_ratio = 1.0 - (pnl / peak)  # 0 = at peak, 1 = all profit gone
+            else:
+                fade_ratio = 0.0
+
+            # Start stall clock once trade age exceeds stall_minutes
+            if age_minutes >= self.zp_stall_minutes:
+                if tracker["stall_start"] is None:
+                    tracker["stall_start"] = now
+                    self.logger.info(
+                        f"ZP PROFIT WATCH: {symbol} {action} age={age_minutes:.0f}min "
+                        f"peak=${peak:.2f} current=${pnl:.2f} fade={fade_ratio:.0%}"
+                    )
+
+                stall_elapsed = (now - tracker["stall_start"]).total_seconds() / 60.0
+
+                # Close conditions:
+                # A) Lost significant chunk of peak profit (40%+) — take what's left
+                # B) Deadline reached (60 min) and trade is below peak — lock it in
+                # C) Trade went from profitable to breakeven/losing — exit now
+                should_close = False
+                close_reason = ""
+
+                if pnl <= 0 and peak >= 2.0:
+                    # Was profitable, now losing — exit immediately
+                    should_close = True
+                    close_reason = f"profit-to-loss (peak=${peak:.2f} now=${pnl:.2f})"
+                elif fade_ratio >= self.zp_profit_fade_pct and pnl > 0:
+                    # Lost 40%+ of peak but still profitable — take remaining profit
+                    should_close = True
+                    close_reason = (
+                        f"profit-fade {fade_ratio:.0%} "
+                        f"(peak=${peak:.2f} now=${pnl:.2f})"
+                    )
+                elif age_minutes >= self.zp_close_deadline_minutes and pnl > 0 and pnl < peak * 0.80:
+                    # 60 min deadline and not near peak — close to lock in
+                    should_close = True
+                    close_reason = (
+                        f"stall-deadline {age_minutes:.0f}min "
+                        f"(peak=${peak:.2f} now=${pnl:.2f})"
+                    )
+
+                if should_close:
+                    self.logger.warning(
+                        f"ZP PROFIT PROTECT: {symbol} {action} — {close_reason} — CLOSING"
+                    )
+                    self._mt5_close_position(ticket, symbol, action, volume)
+                    self._zp_position_tracker.pop(ticket, None)
+                    return
+
+        # --- 3. BREAK-EVEN MOVE ---
+        # Once in profit by zp_breakeven_pips, move SL to entry + 1 pip buffer
+        sym_info = mt5_lib.symbol_info(symbol)
+        if sym_info is None:
+            return
+        point = sym_info.point
+        digits = sym_info.digits
+
+        profit_pips = 0.0
+        if action == "BUY":
+            profit_pips = (current_price - entry) / (point * 10)
+        else:
+            profit_pips = (entry - current_price) / (point * 10)
+
+        be_sl = None
+        if profit_pips >= self.zp_breakeven_pips:
+            # Move SL to entry + 1 pip buffer in our favor
+            buffer = point * 10  # 1 pip
+            if action == "BUY":
+                be_sl = round(entry + buffer, digits)
+                # Only move if current SL is below break-even
+                if current_sl >= be_sl:
+                    be_sl = None
+            else:
+                be_sl = round(entry - buffer, digits)
+                if current_sl != 0 and current_sl <= be_sl:
+                    be_sl = None
+
+        # --- 3. ZP TRAILING STOP ---
+        # Re-compute ZeroPoint ATR trailing stop from live H4 data
+        # and tighten SL if it's moved in our favor
+        trail_sl = None
+        try:
+            h4_rates = self.mt5_connector.get_rates(symbol, mt5.TIMEFRAME_H4, 0, 200)
+            if h4_rates:
+                df_h4 = self._prepare_ohlc_dataframe(h4_rates)
+                if df_h4 is not None and len(df_h4) >= 15:
+                    zp_state = compute_zeropoint_state(df_h4)
+                    if zp_state is not None and len(zp_state) > 0:
+                        zp_stop = float(zp_state.iloc[-1].get("xATRTrailingStop", 0))
+                        zp_pos = int(zp_state.iloc[-1].get("pos", 0))
+                        if zp_stop > 0:
+                            # Only trail if ZP direction still matches our trade
+                            if action == "BUY" and zp_pos == 1:
+                                new_sl = round(zp_stop, digits)
+                                # Only tighten (move SL up for BUY)
+                                if new_sl > current_sl:
+                                    trail_sl = new_sl
+                            elif action == "SELL" and zp_pos == -1:
+                                new_sl = round(zp_stop, digits)
+                                # Only tighten (move SL down for SELL)
+                                if current_sl == 0 or new_sl < current_sl:
+                                    trail_sl = new_sl
+
+                            # ZP flipped against us — close the trade
+                            if (action == "BUY" and zp_pos == -1) or \
+                               (action == "SELL" and zp_pos == 1):
+                                self.logger.warning(
+                                    f"ZP FLIP EXIT: {symbol} {action} — ZP flipped against us, CLOSING"
+                                )
+                                self._mt5_close_position(ticket, symbol, action, volume)
+                                self._zp_position_tracker.pop(ticket, None)
+                                return
+        except Exception as e:
+            self.logger.debug(f"ZP trail error {symbol}: {e}")
+
+        # --- Apply the best new SL (whichever is tighter) ---
+        new_sl = current_sl
+        if be_sl is not None:
+            if action == "BUY":
+                new_sl = max(new_sl, be_sl)
+            else:
+                new_sl = min(new_sl, be_sl) if new_sl != 0 else be_sl
+        if trail_sl is not None:
+            if action == "BUY":
+                new_sl = max(new_sl, trail_sl)
+            else:
+                new_sl = min(new_sl, trail_sl) if new_sl != 0 else trail_sl
+
+        # Only send modify if SL actually changed
+        if new_sl != current_sl and new_sl > 0:
+            reason = []
+            if be_sl is not None and new_sl == be_sl:
+                reason.append("break-even")
+            if trail_sl is not None and new_sl == trail_sl:
+                reason.append("ZP-trail")
+            reason_str = "+".join(reason) or "tighten"
+            self._mt5_modify_sl(ticket, symbol, new_sl, current_tp, reason_str)
+
+    def _mt5_close_position(self, ticket: int, symbol: str, action: str, volume: float):
+        """Send MT5 close order for a position."""
+        import MetaTrader5 as mt5_lib
+
+        sym_info = mt5_lib.symbol_info(symbol)
+        if sym_info is None:
+            return
+
+        if action == "BUY":
+            close_type = mt5.ORDER_TYPE_SELL
+            price = sym_info.bid
+        else:
+            close_type = mt5.ORDER_TYPE_BUY
+            price = sym_info.ask
+
+        request = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": volume,
+            "type": close_type,
+            "position": ticket,
+            "price": price,
+            "deviation": 20,
+            "magic": 123456,
+            "comment": "ZP-monitor-exit",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_FOK,
+        }
+
+        result = mt5_lib.order_send(request)
+        if result and result.retcode == mt5_lib.TRADE_RETCODE_DONE:
+            self.logger.info(f"ZP CLOSED {symbol} {action} ticket={ticket} @ {price}")
+            # Update internal tracker
+            if ticket in self.positions:
+                self.positions[ticket].status = 'CLOSED'
+                self.positions[ticket].current_price = price
+                self._register_closed_position(self.positions[ticket])
+        else:
+            # Try other fill modes
+            for fill in [mt5.ORDER_FILLING_IOC, mt5.ORDER_FILLING_RETURN]:
+                request["type_filling"] = fill
+                result = mt5_lib.order_send(request)
+                if result and result.retcode == mt5_lib.TRADE_RETCODE_DONE:
+                    self.logger.info(f"ZP CLOSED {symbol} {action} ticket={ticket} @ {price}")
+                    if ticket in self.positions:
+                        self.positions[ticket].status = 'CLOSED'
+                        self.positions[ticket].current_price = price
+                        self._register_closed_position(self.positions[ticket])
+                    return
+            self.logger.error(f"ZP close FAILED {symbol}: {result}")
+
+    def _mt5_modify_sl(self, ticket: int, symbol: str, new_sl: float, tp: float, reason: str):
+        """Modify SL on an open MT5 position."""
+        import MetaTrader5 as mt5_lib
+
+        request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "symbol": symbol,
+            "position": ticket,
+            "sl": new_sl,
+            "tp": tp,
+        }
+
+        result = mt5_lib.order_send(request)
+        if result and result.retcode == mt5_lib.TRADE_RETCODE_DONE:
+            self.logger.info(
+                f"ZP SL updated ({reason}): {symbol} ticket={ticket} new_SL={new_sl}"
+            )
+        else:
+            self.logger.debug(f"ZP SL modify failed {symbol}: {result}")
+
     def _update_positions(self):
         """Update position information and check for exits"""
         try:
+            # ZeroPoint active management (trail SL, max loss, break-even)
+            self._zp_manage_positions()
+
             # Get current positions from MT5
             mt5_positions = self.mt5_connector.get_positions()
-            
+
             # Update our position tracking
             for ticket, position in list(self.positions.items()):
                 # Find position in MT5
@@ -1890,12 +3286,12 @@ class TradingEngine:
                     if pos['ticket'] == ticket:
                         mt5_pos = pos
                         break
-                
+
                 if mt5_pos:
                     # Update position data
                     position.current_price = mt5_pos['price_current']
                     position.unrealized_pnl = mt5_pos['profit']
-                    
+
                     # Check exit conditions
                     if self._should_close_position(position, mt5_pos):
                         self._close_position(position)
@@ -1904,15 +3300,15 @@ class TradingEngine:
                     self._register_closed_position(position)
                     position.status = 'CLOSED'
                     self.logger.info(f"Position {ticket} closed")
-            
+
         except Exception as e:
             self.logger.error(f"Error updating positions: {e}")
-    
+
     def _should_close_position(self, position: Position, mt5_pos: Dict[str, Any]) -> bool:
         """Determine if position should be closed"""
         try:
             current_price = mt5_pos['price_current']
-            
+
             if position.action == 'BUY':
                 # Check stop loss
                 if current_price <= position.stop_loss:
@@ -1927,22 +3323,19 @@ class TradingEngine:
                 # Check take profit
                 if current_price <= position.take_profit:
                     return True
-            
+
             return False
-            
+
         except Exception as e:
             self.logger.error(f"Error checking exit conditions: {e}")
             return False
-    
+
     def _close_position(self, position: Position):
         """Close a position"""
         try:
-            # This would implement position closing logic
-            # For now, just mark as closed
-            self._register_closed_position(position)
-            position.status = 'CLOSED'
-            self.logger.info(f"Position {position.ticket} closed: {position.symbol} {position.action}")
-            
+            self._mt5_close_position(
+                position.ticket, position.symbol, position.action, position.position_size
+            )
         except Exception as e:
             self.logger.error(f"Error closing position: {e}")
     
