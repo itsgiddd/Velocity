@@ -1007,6 +1007,21 @@ class TradingApp(QMainWindow):
                     SWING_LOOKBACK, SL_ATR_MIN_MULT,
                 )
 
+                # Initialize FlipPredictor AI
+                flip_predictor = None
+                try:
+                    from flip_predictor_inference import FlipPredictorEngine
+                    from flip_predictor_integration import FlipPredictorDecisionMaker
+                    fp_engine = FlipPredictorEngine()
+                    fp_decision = FlipPredictorDecisionMaker()
+                    if fp_engine.is_loaded:
+                        flip_predictor = (fp_engine, fp_decision)
+                        self._log("<span style='color:#4A8C5D'>FlipPredictor AI loaded</span>")
+                    else:
+                        self._log("FlipPredictor: no model found, running without AI predictions")
+                except Exception as e:
+                    self._log(f"FlipPredictor init skipped: {e}")
+
                 while getattr(self, '_zp_running', False):
                     try:
                         selected = [p for p, c in self.pair_checks.items() if c.isChecked()]
@@ -1117,6 +1132,34 @@ class TradingApp(QMainWindow):
                                     elif direction == "SELL" and h1_pos == -1:
                                         h1_conf = True
 
+                            # --- FlipPredictor AI enhancement ---
+                            fp_decision_obj = None
+                            fp_tag = ""
+                            if flip_predictor is not None:
+                                fp_engine, fp_dm = flip_predictor
+                                try:
+                                    prediction = fp_engine.predict(df_h4, norm, sym_info.point)
+                                    if prediction is not None:
+                                        has_flip = is_fresh and bars_since <= 1
+                                        fp_decision_obj = fp_dm.evaluate_signal(
+                                            prediction=prediction,
+                                            current_zp_direction=pos_val,
+                                            has_zp_flip=has_flip,
+                                            zp_flip_direction=pos_val if has_flip else 0,
+                                        )
+                                        fp_tag = f" [AI:{fp_decision_obj.action}]"
+
+                                        # Skip if AI says skip
+                                        if fp_decision_obj.action == "SKIP":
+                                            self._log(f"  {symbol}: AI SKIP - {fp_decision_obj.reason}")
+                                            continue
+
+                                        # Exit early signal (log warning for existing positions)
+                                        if fp_decision_obj.action == "EXIT_EARLY":
+                                            self._log(f"  <span style='color:#D4A040'>{symbol}: AI warns trend exhausted ({fp_decision_obj.reason})</span>")
+                                except Exception as e:
+                                    pass  # Silently continue without AI
+
                             # Quality score for ranking (higher = better trade)
                             # R:R is king — a 3.0 R:R trade is worth way more than a 1.5
                             score = 0.0
@@ -1128,6 +1171,16 @@ class TradingApp(QMainWindow):
                             # Age penalty — stale signals lose points
                             if not is_fresh:
                                 score -= min(bars_since * 1.0, 40)
+
+                            # AI bonus/penalty
+                            if fp_decision_obj is not None:
+                                if fp_decision_obj.action == "FULL_CONFIDENCE":
+                                    score += 25               # AI agrees strongly
+                                elif fp_decision_obj.action == "PREDICTIVE_ENTRY":
+                                    score += 15               # AI sees opportunity
+                                elif fp_decision_obj.action == "REDUCED_SIZE":
+                                    score -= 10               # AI has reservations
+
                             score = max(0, score)
 
                             tier = "S" if (is_fresh and h1_conf) else ("A" if h1_conf or is_fresh else "B")
@@ -1142,14 +1195,15 @@ class TradingApp(QMainWindow):
                                 risk_reward=rr,
                             )
 
-                            h1_tag = " [H1 ✓]" if h1_conf else ""
+                            h1_tag = " [H1 OK]" if h1_conf else ""
                             fresh_tag = " FRESH" if is_fresh else f" age={bars_since}b"
                             self._log(
                                 f"  {symbol}: H4 {sig.direction} "
                                 f"R:R={rr:.2f} score={score:.0f} "
-                                f"tier={tier}{fresh_tag}{h1_tag}"
+                                f"tier={tier}{fresh_tag}{h1_tag}{fp_tag}"
                             )
-                            signals.append((sig, sym_resolved, score))
+                            ai_size_mult = fp_decision_obj.size_multiplier if fp_decision_obj is not None else 1.0
+                            signals.append((sig, sym_resolved, score, ai_size_mult))
 
                         # Rank by score, take top 2 — concentrate on best setups
                         MAX_TRADES = 2
@@ -1161,8 +1215,12 @@ class TradingApp(QMainWindow):
                                 skip_names = ", ".join(s[1] for s in skipped)
                                 self._log(f"  Skipping lower-ranked: {skip_names}")
                             self._log(f"Placing top {len(top)} trade(s)...")
-                            for sig, sym_resolved, sc in top:
+                            for sig, sym_resolved, sc, ai_mult in top:
                                 lot = self._calc_lot_size(sig, sym_resolved, use_fixed, fixed_lot, risk_pct)
+                                # AI size adjustment
+                                if ai_mult < 1.0 and lot > 0:
+                                    lot = max(0.01, round(lot * ai_mult, 2))
+                                    self._log(f"  AI adjusted lot: {lot} (x{ai_mult:.0%})")
                                 if lot > 0:
                                     self._zp_place_trade(sig, sym_resolved, lot)
                         else:
