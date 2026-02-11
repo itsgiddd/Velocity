@@ -1007,21 +1007,6 @@ class TradingApp(QMainWindow):
                     SWING_LOOKBACK, SL_ATR_MIN_MULT,
                 )
 
-                # Initialize FlipPredictor AI
-                flip_predictor = None
-                try:
-                    from flip_predictor_inference import FlipPredictorEngine
-                    from flip_predictor_integration import FlipPredictorDecisionMaker
-                    fp_engine = FlipPredictorEngine()
-                    fp_decision = FlipPredictorDecisionMaker()
-                    if fp_engine.is_loaded:
-                        flip_predictor = (fp_engine, fp_decision)
-                        self._log("<span style='color:#4A8C5D'>FlipPredictor AI loaded</span>")
-                    else:
-                        self._log("FlipPredictor: no model found, running without AI predictions")
-                except Exception as e:
-                    self._log(f"FlipPredictor init skipped: {e}")
-
                 while getattr(self, '_zp_running', False):
                     try:
                         selected = [p for p, c in self.pair_checks.items() if c.isChecked()]
@@ -1180,22 +1165,6 @@ class TradingApp(QMainWindow):
                                 score += 20                    # H1 alignment
                             if not is_fresh:
                                 score -= min(bars_since * 1.0, 40)
-
-                            # AI ranking boost (never blocks, only helps pick best)
-                            if flip_predictor is not None:
-                                fp_engine, fp_dm = flip_predictor
-                                try:
-                                    prediction = fp_engine.predict(df_h4, norm, sym_info.point)
-                                    if prediction is not None:
-                                        if prediction.trend_continues_prob > 0.60:
-                                            score += 25
-                                        elif prediction.trend_continues_prob < 0.30:
-                                            score -= 15
-                                        if prediction.flip_imminent:
-                                            score -= 10
-                                except Exception:
-                                    pass
-
                             score = max(0, score)
 
                             tier = "S" if (is_fresh and h1_conf) else ("A" if h1_conf or is_fresh else "B")
