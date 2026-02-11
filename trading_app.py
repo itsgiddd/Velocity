@@ -1210,8 +1210,14 @@ class TradingApp(QMainWindow):
                                 skip_names = ", ".join(s[1] for s in skipped)
                                 self._log(f"  Skipping lower-ranked: {skip_names}")
                             self._log(f"Placing top {len(top)} trade(s)...")
-                            for sig, sym_resolved, sc, ai_mult in top:
-                                lot = self._calc_lot_size(sig, sym_resolved, use_fixed, fixed_lot, risk_pct)
+                            for trade_idx, (sig, sym_resolved, sc, ai_mult) in enumerate(top):
+                                if trade_idx == 0:
+                                    # Trade 1: full fixed lot
+                                    lot = self._calc_lot_size(sig, sym_resolved, use_fixed, fixed_lot, risk_pct)
+                                else:
+                                    # Trade 2+: adaptive — scale to remaining margin
+                                    lot = self._calc_lot_size(sig, sym_resolved, False, fixed_lot, risk_pct)
+                                    self._log(f"  Trade #{trade_idx+1}: adaptive lot={lot}")
                                 # AI size adjustment
                                 if ai_mult < 1.0 and lot > 0:
                                     lot = max(0.01, round(lot * ai_mult, 2))
