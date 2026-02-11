@@ -1029,12 +1029,53 @@ class TradingApp(QMainWindow):
                         fixed_lot = self._float(self.inp_lot, 0.40)
                         risk_pct = self._float(self.inp_risk, 8) / 100.0
 
-                        # Track which symbols already have open positions
+                        # Check open positions — close if H4 ZP flipped against them
                         open_positions = mt5_lib.positions_get()
                         open_symbols = set()
                         if open_positions:
                             for pos in open_positions:
-                                open_symbols.add(pos.symbol.upper().replace(".", "").replace("#", ""))
+                                pos_sym = pos.symbol
+                                pos_norm = pos_sym.upper().replace(".", "").replace("#", "")
+                                open_symbols.add(pos_norm)
+
+                                # Check H4 ZP direction for this position
+                                try:
+                                    rates = mt5_lib.copy_rates_from_pos(pos_sym, mt5_lib.TIMEFRAME_H4, 0, 50)
+                                    if rates is not None and len(rates) >= 20:
+                                        df_tmp = pd.DataFrame(rates)
+                                        df_tmp["time"] = pd.to_datetime(df_tmp["time"], unit="s")
+                                        zp_tmp = compute_zeropoint_state(df_tmp)
+                                        if zp_tmp is not None and len(zp_tmp) >= 2:
+                                            zp_dir = int(zp_tmp.iloc[-1].get("pos", 0))
+                                            # pos.type: 0=BUY, 1=SELL
+                                            trade_is_buy = pos.type == 0
+                                            zp_is_buy = zp_dir == 1
+
+                                            if zp_dir != 0 and trade_is_buy != zp_is_buy:
+                                                # ZP flipped against our trade — close it
+                                                close_req = {
+                                                    "action": mt5_lib.TRADE_ACTION_DEAL,
+                                                    "symbol": pos_sym,
+                                                    "volume": pos.volume,
+                                                    "type": mt5_lib.ORDER_TYPE_SELL if trade_is_buy else mt5_lib.ORDER_TYPE_BUY,
+                                                    "position": pos.ticket,
+                                                    "magic": 999,
+                                                    "comment": "ZP flip exit",
+                                                    "type_filling": mt5_lib.ORDER_FILLING_IOC,
+                                                }
+                                                result = mt5_lib.order_send(close_req)
+                                                pnl = pos.profit
+                                                direction_was = "BUY" if trade_is_buy else "SELL"
+                                                new_dir = "BUY" if zp_is_buy else "SELL"
+                                                color = "#4A8C5D" if pnl >= 0 else "#C44444"
+                                                self._log(
+                                                    f"  <span style='color:{color}'>{pos_norm}: ZP flipped {direction_was}->{new_dir} "
+                                                    f"| Closed P/L=${pnl:+.2f}</span>"
+                                                )
+                                                if result and result.retcode == mt5_lib.TRADE_RETCODE_DONE:
+                                                    open_symbols.discard(pos_norm)
+                                except Exception:
+                                    pass
 
                         signals = []
 
