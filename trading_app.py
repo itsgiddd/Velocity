@@ -1142,7 +1142,8 @@ class TradingApp(QMainWindow):
                                             has_zp_flip=has_flip,
                                             zp_flip_direction=pos_val if has_flip else 0,
                                         )
-                                        fp_tag = f" [AI:{fp_decision_obj.action}]"
+                                        if fp_decision_obj.action != "NO_ACTION":
+                                            fp_tag = f" [AI:{fp_decision_obj.action}]"
 
                                         # Skip if AI says skip
                                         if fp_decision_obj.action == "SKIP":
