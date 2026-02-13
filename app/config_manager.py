@@ -52,8 +52,8 @@ class ConfigManager:
         """Get default configuration values"""
         return {
             'main': {
-                'app_name': 'Neural Forex Trading App',
-                'version': '1.0.0',
+                'app_name': 'ACI Trading System',
+                'version': '2.0.0',
                 'update_interval': 5,  # seconds
                 'max_log_files': 10,
                 'log_level': 'INFO',

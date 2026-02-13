@@ -25,11 +25,11 @@ from typing import Dict, List, Optional
 import logging
 
 class DemoTradingApp:
-    """Demo neural forex trading application"""
-    
+    """Demo ACI trading application"""
+
     def __init__(self, root):
         self.root = root
-        self.root.title("Neural Forex Trading App - Demo Mode")
+        self.root.title("ACI Trading System - Demo Mode")
         self.root.geometry("1000x700")
         
         # Demo data

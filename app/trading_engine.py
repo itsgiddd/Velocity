@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Neural Trading Engine
-====================
+ACI Trading Engine
+==================
 
-Professional trading engine that integrates neural network predictions
+Professional AI trading engine that integrates neural network predictions
 with MT5 trading operations for automated forex trading.
 
 Features:
@@ -250,7 +250,7 @@ class TradingEngine:
         # Per-position tracking: ticket -> {peak_pnl, peak_time, stall_start}
         self._zp_position_tracker: Dict[int, Dict[str, Any]] = {}
 
-        self.logger.info("Neural Trading Engine initialized (ZeroPoint PRO enabled)")
+        self.logger.info("ACI Trading Engine initialized (ZeroPoint PRO enabled)")
     
     def start(self):
         """Start the trading engine"""
@@ -299,7 +299,7 @@ class TradingEngine:
         self.trading_thread = threading.Thread(target=self._trading_loop, daemon=True)
         self.trading_thread.start()
 
-        self.logger.info("Neural Trading Engine started")
+        self.logger.info("ACI Trading Engine started")
     
     def stop(self):
         """Stop the trading engine"""
@@ -312,7 +312,7 @@ class TradingEngine:
         if self.trading_thread and self.trading_thread.is_alive():
             self.trading_thread.join(timeout=5)
         
-        self.logger.info("Neural Trading Engine stopped")
+        self.logger.info("ACI Trading Engine stopped")
 
     def _sync_mt5_positions(self):
         """Load existing MT5 open positions into internal tracker.
@@ -3163,7 +3163,7 @@ class TradingEngine:
                                 if current_sl == 0 or new_sl < current_sl:
                                     trail_sl = new_sl
 
-                            # ZP flipped against us — close the trade
+                            # ZP flipped against us — close trade (Pine Script: close on signal switch)
                             if (action == "BUY" and zp_pos == -1) or \
                                (action == "SELL" and zp_pos == 1):
                                 self.logger.warning(

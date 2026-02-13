@@ -35,7 +35,7 @@ class UltimateScalpingDashboard:
     
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Ultimate Scalping System Dashboard")
+        self.root.title("ACI Scalping Dashboard")
         self.root.geometry("1400x900")
         self.root.configure(bg='#1a1a1a')
         

@@ -24,11 +24,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 class FixedNeuralTradingApp:
-    """Fixed neural forex trading application"""
-    
+    """Fixed ACI trading application"""
+
     def __init__(self, root):
         self.root = root
-        self.root.title("Neural Forex Trading App - Fixed Version")
+        self.root.title("ACI Trading System - Fixed Version")
         self.root.geometry("1000x700")
         
         # Trading state

@@ -17,8 +17,20 @@ from PySide6.QtWidgets import (
     QGroupBox, QTableWidget, QTableWidgetItem, QTextEdit,
     QHeaderView, QFrame, QAbstractItemView,
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QColor
+
+# Global crash handler — writes to crash.log so we can debug after a crash
+import traceback as _tb
+def _global_exception_hook(exc_type, exc_value, exc_tb):
+    crash_msg = ''.join(_tb.format_exception(exc_type, exc_value, exc_tb))
+    try:
+        with open('crash.log', 'a') as f:
+            f.write(f"\n{'='*60}\n{datetime.now()}\n{crash_msg}\n")
+    except Exception:
+        pass
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+sys.excepthook = _global_exception_hook
 
 # Safe imports — show clear errors instead of silent crashes
 _IMPORT_ERRORS = []
@@ -321,6 +333,7 @@ ALL_PAIRS = [
 
 
 class TradingApp(QMainWindow):
+    _log_signal = Signal(str)
 
     def __init__(self):
         super().__init__()
@@ -339,6 +352,9 @@ class TradingApp(QMainWindow):
 
         self._build_ui()
         self._load_settings()
+
+        # Thread-safe logging
+        self._log_signal.connect(self._log_on_main_thread)
 
         # Live update timer
         self.timer = QTimer(self)
@@ -441,7 +457,7 @@ class TradingApp(QMainWindow):
         self.inp_risk.setFixedWidth(70)
         mode_grid.addWidget(self.inp_risk, 1, 1)
 
-        mode_grid.addWidget(QLabel("Min Confidence %:"), 2, 0)
+        mode_grid.addWidget(QLabel("Min Conf %:"), 2, 0)
         self.inp_conf = QLineEdit("65")
         self.inp_conf.setFixedWidth(70)
         mode_grid.addWidget(self.inp_conf, 2, 1)
@@ -563,6 +579,15 @@ class TradingApp(QMainWindow):
     # Helpers
     # ------------------------------------------------------------------
     def _log(self, msg):
+        if threading.current_thread() is not threading.main_thread():
+            try:
+                self._log_signal.emit(msg)
+            except RuntimeError:
+                pass
+            return
+        self._log_on_main_thread(msg)
+
+    def _log_on_main_thread(self, msg):
         ts = datetime.now().strftime('%H:%M:%S')
         self.log_view.append(f"<span style='color:#B0AEA5'>[{ts}]</span> {msg}")
         bar = self.log_view.verticalScrollBar()
@@ -929,7 +954,7 @@ class TradingApp(QMainWindow):
             'fixed_lots': self.chk_fixed_lots.isChecked(),
             'lot_size': self.inp_lot.text(),
             'risk_pct': self.inp_risk.text(),
-            'confidence_pct': self.inp_conf.text(),
+            'min_conf': self.inp_conf.text(),
             'max_loss': self.inp_maxloss.text(),
             'be_pips': self.inp_be.text(),
             'stall_min': self.inp_stall.text(),
@@ -957,7 +982,7 @@ class TradingApp(QMainWindow):
             self.chk_fixed_lots.setChecked(s.get('fixed_lots', True))
             self.inp_lot.setText(s.get('lot_size', '0.40'))
             self.inp_risk.setText(s.get('risk_pct', '8'))
-            self.inp_conf.setText(s.get('confidence_pct', '65'))
+            self.inp_conf.setText(s.get('min_conf', '65'))
             self.inp_maxloss.setText(s.get('max_loss', '80'))
             self.inp_be.setText(s.get('be_pips', '15'))
             self.inp_stall.setText(s.get('stall_min', '30'))

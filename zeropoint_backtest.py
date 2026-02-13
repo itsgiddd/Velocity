@@ -289,7 +289,10 @@ def compute_atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.Series:
         (df["high"] - prev_close).abs(),
         (df["low"] - prev_close).abs(),
     ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+    # Pine Script ta.atr() uses Wilder's RMA (alpha = 1/period)
+    atr = tr.ewm(alpha=1.0 / period, adjust=False).mean()
+    atr.iloc[:period - 1] = np.nan
+    return atr
 
 
 # ---------------------------------------------------------------------------

@@ -11,8 +11,8 @@ Features:
 - Profit/loss tracking
 - Easy MT5 connection
 
-Author: Neural Trading System
-Version: 1.0.0
+Author: ACI
+Version: 2.0.0
 """
 
 import tkinter as tk
@@ -29,11 +29,11 @@ from clean_live_trading_bot import LiveNeuralTradingBot, TradingMode, TradeResul
 from datetime import datetime
 
 class NeuralTraderGUI:
-    """Main GUI Application for Neural Forex Trader"""
-    
+    """Main GUI Application for ACI Trading System"""
+
     def __init__(self, root):
         self.root = root
-        self.root.title("Neural Forex Trader - Auto Trading System")
+        self.root.title("ACI Trading System - Auto Trading")
         self.root.geometry("900x700")
         self.root.configure(bg='#1e1e2e')
         

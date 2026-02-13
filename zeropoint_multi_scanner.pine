@@ -1,0 +1,284 @@
+// This Pine Script™ code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+
+//@version=6
+indicator("ZeroPoint PRO Multi-Scanner", overlay=false)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// STRATEGY PARAMETERS (must match ZeroPoint PRO exactly)
+// ═══════════════════════════════════════════════════════════════════════════
+
+ATR_PERIOD      = 10
+ATR_MULTIPLIER  = 3.0
+TP1_MULT        = 2.0
+TP2_MULT        = 3.5
+TP3_MULT        = 5.0
+SWING_LOOKBACK  = 10
+SL_BUFFER_PCT   = 0.001    // 0.1%
+SL_ATR_MIN_MULT = 1.5
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SYMBOL INPUTS (user-configurable)
+// ═══════════════════════════════════════════════════════════════════════════
+
+sym1 = input.symbol("FX:EURUSD",  "Symbol 1", group="Symbols")
+sym2 = input.symbol("FX:GBPUSD",  "Symbol 2", group="Symbols")
+sym3 = input.symbol("FX:USDJPY",  "Symbol 3", group="Symbols")
+sym4 = input.symbol("FX:AUDUSD",  "Symbol 4", group="Symbols")
+sym5 = input.symbol("FX:USDCAD",  "Symbol 5", group="Symbols")
+sym6 = input.symbol("FX:NZDUSD",  "Symbol 6", group="Symbols")
+sym7 = input.symbol("FX:EURJPY",  "Symbol 7", group="Symbols")
+sym8 = input.symbol("FX:GBPJPY",  "Symbol 8", group="Symbols")
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CORE ZP FUNCTION — full state machine, runs per-symbol via request.security()
+// Each call site gets its own independent var state.
+// ═══════════════════════════════════════════════════════════════════════════
+
+calcZP() =>
+    // --- ATR (Wilder's RMA, same as ta.atr) ---
+    float atrVal = ta.atr(ATR_PERIOD)
+    float nLoss  = atrVal * ATR_MULTIPLIER
+
+    // --- Persistent state (var = survives across bars, independent per call site) ---
+    var float xATRTrailingStop = na
+    var int   pos              = 0
+    var int   lastSignalDir    = 0
+
+    float prevStop  = nz(xATRTrailingStop[1], close)
+    float prevClose = nz(close[1], close)
+
+    // --- 4-branch trailing stop (EXACT match to Pine Script ZP PRO) ---
+    if close > prevStop and prevClose > prevStop
+        xATRTrailingStop := math.max(prevStop, close - nLoss)
+        pos := 1
+    else if close < prevStop and prevClose < prevStop
+        xATRTrailingStop := math.min(prevStop, close + nLoss)
+        pos := -1
+    else if close > prevStop
+        xATRTrailingStop := close - nLoss
+        pos := 1
+    else
+        xATRTrailingStop := close + nLoss
+        pos := -1
+
+    // --- Signal detection with lastSignalDir filter ---
+    bool flippedToBuy  = (pos == 1  and nz(pos[1], 0) != 1)
+    bool flippedToSell = (pos == -1 and nz(pos[1], 0) != -1)
+
+    bool buySignal  = flippedToBuy  and lastSignalDir != 1
+    bool sellSignal = flippedToSell and lastSignalDir != -1
+
+    if buySignal
+        lastSignalDir := 1
+    if sellSignal
+        lastSignalDir := -1
+
+    // --- Smart Structure SL ---
+    float slLevel = na
+    if buySignal
+        float recentSwingLow = ta.lowest(low, SWING_LOOKBACK)
+        float buf            = recentSwingLow * SL_BUFFER_PCT
+        float structuralSL   = recentSwingLow - buf
+        float atrMinSL       = close - (atrVal * SL_ATR_MIN_MULT)
+        slLevel := structuralSL > atrMinSL ? atrMinSL : structuralSL
+    else if sellSignal
+        float recentSwingHigh = ta.highest(high, SWING_LOOKBACK)
+        float buf             = recentSwingHigh * SL_BUFFER_PCT
+        float structuralSL    = recentSwingHigh + buf
+        float atrMinSL        = close + (atrVal * SL_ATR_MIN_MULT)
+        slLevel := structuralSL < atrMinSL ? atrMinSL : structuralSL
+
+    // --- TP levels ---
+    float tp1Val = na
+    float tp2Val = na
+    float tp3Val = na
+    if buySignal
+        tp1Val := close + atrVal * TP1_MULT
+        tp2Val := close + atrVal * TP2_MULT
+        tp3Val := close + atrVal * TP3_MULT
+    else if sellSignal
+        tp1Val := close - atrVal * TP1_MULT
+        tp2Val := close - atrVal * TP2_MULT
+        tp3Val := close - atrVal * TP3_MULT
+
+    // --- R:R ratio ---
+    float rrRatio = na
+    if buySignal and not na(slLevel)
+        float slDist = close - slLevel
+        float tpDist = tp1Val - close
+        rrRatio := slDist > 0 ? tpDist / slDist : na
+    else if sellSignal and not na(slLevel)
+        float slDist = slLevel - close
+        float tpDist = close - tp1Val
+        rrRatio := slDist > 0 ? tpDist / slDist : na
+
+    // Return 11-value tuple
+    [buySignal, sellSignal, pos, close, slLevel, tp1Val, tp2Val, tp3Val, atrVal, rrRatio, xATRTrailingStop]
+
+// ═══════════════════════════════════════════════════════════════════════════
+// FETCH H4 DATA FOR ALL 8 SYMBOLS
+// ═══════════════════════════════════════════════════════════════════════════
+
+[buy1, sell1, pos1, entry1, sl1, tp1_1, tp2_1, tp3_1, atr1, rr1, stop1] = request.security(sym1, "240", calcZP(), barmerge.gaps_off, barmerge.lookahead_off)
+[buy2, sell2, pos2, entry2, sl2, tp1_2, tp2_2, tp3_2, atr2, rr2, stop2] = request.security(sym2, "240", calcZP(), barmerge.gaps_off, barmerge.lookahead_off)
+[buy3, sell3, pos3, entry3, sl3, tp1_3, tp2_3, tp3_3, atr3, rr3, stop3] = request.security(sym3, "240", calcZP(), barmerge.gaps_off, barmerge.lookahead_off)
+[buy4, sell4, pos4, entry4, sl4, tp1_4, tp2_4, tp3_4, atr4, rr4, stop4] = request.security(sym4, "240", calcZP(), barmerge.gaps_off, barmerge.lookahead_off)
+[buy5, sell5, pos5, entry5, sl5, tp1_5, tp2_5, tp3_5, atr5, rr5, stop5] = request.security(sym5, "240", calcZP(), barmerge.gaps_off, barmerge.lookahead_off)
+[buy6, sell6, pos6, entry6, sl6, tp1_6, tp2_6, tp3_6, atr6, rr6, stop6] = request.security(sym6, "240", calcZP(), barmerge.gaps_off, barmerge.lookahead_off)
+[buy7, sell7, pos7, entry7, sl7, tp1_7, tp2_7, tp3_7, atr7, rr7, stop7] = request.security(sym7, "240", calcZP(), barmerge.gaps_off, barmerge.lookahead_off)
+[buy8, sell8, pos8, entry8, sl8, tp1_8, tp2_8, tp3_8, atr8, rr8, stop8] = request.security(sym8, "240", calcZP(), barmerge.gaps_off, barmerge.lookahead_off)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPER FUNCTIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Strip exchange prefix: "FX:EURUSD" → "EURUSD"
+getCleanTicker(string fullSym) =>
+    int colonPos = str.pos(fullSym, ":")
+    na(colonPos) ? fullSym : str.substring(fullSym, colonPos + 1)
+
+// Build JSON payload matching webhook_bridge.py parser
+buildJSON(string action, string sym, float entryP, float slP, float tp1P, float tp2P, float tp3P, float atrP, float rrP) =>
+    '{"action":"' + action + '",' +
+     '"symbol":"' + getCleanTicker(sym) + '",' +
+     '"entry":' + str.tostring(entryP, "#.#####") + ',' +
+     '"sl":' + str.tostring(slP, "#.#####") + ',' +
+     '"tp1":' + str.tostring(tp1P, "#.#####") + ',' +
+     '"tp2":' + str.tostring(tp2P, "#.#####") + ',' +
+     '"tp3":' + str.tostring(tp3P, "#.#####") + ',' +
+     '"atr":' + str.tostring(atrP, "#.#####") + ',' +
+     '"rr":' + str.tostring(nz(rrP, 0), "#.##") + ',' +
+     '"timeframe":"240"}'
+
+// ═══════════════════════════════════════════════════════════════════════════
+// SIGNAL DETECTION & ALERT FIRING
+// Only fire on confirmed H4 bar closes.
+// Each alert() call site is independent — multiple symbols can fire same bar.
+// ═══════════════════════════════════════════════════════════════════════════
+
+if barstate.isconfirmed
+    // Symbol 1
+    if buy1 and not na(sl1)
+        alert(buildJSON("BUY",  sym1, entry1, sl1, tp1_1, tp2_1, tp3_1, atr1, rr1), alert.freq_once_per_bar_close)
+    if sell1 and not na(sl1)
+        alert(buildJSON("SELL", sym1, entry1, sl1, tp1_1, tp2_1, tp3_1, atr1, rr1), alert.freq_once_per_bar_close)
+
+    // Symbol 2
+    if buy2 and not na(sl2)
+        alert(buildJSON("BUY",  sym2, entry2, sl2, tp1_2, tp2_2, tp3_2, atr2, rr2), alert.freq_once_per_bar_close)
+    if sell2 and not na(sl2)
+        alert(buildJSON("SELL", sym2, entry2, sl2, tp1_2, tp2_2, tp3_2, atr2, rr2), alert.freq_once_per_bar_close)
+
+    // Symbol 3
+    if buy3 and not na(sl3)
+        alert(buildJSON("BUY",  sym3, entry3, sl3, tp1_3, tp2_3, tp3_3, atr3, rr3), alert.freq_once_per_bar_close)
+    if sell3 and not na(sl3)
+        alert(buildJSON("SELL", sym3, entry3, sl3, tp1_3, tp2_3, tp3_3, atr3, rr3), alert.freq_once_per_bar_close)
+
+    // Symbol 4
+    if buy4 and not na(sl4)
+        alert(buildJSON("BUY",  sym4, entry4, sl4, tp1_4, tp2_4, tp3_4, atr4, rr4), alert.freq_once_per_bar_close)
+    if sell4 and not na(sl4)
+        alert(buildJSON("SELL", sym4, entry4, sl4, tp1_4, tp2_4, tp3_4, atr4, rr4), alert.freq_once_per_bar_close)
+
+    // Symbol 5
+    if buy5 and not na(sl5)
+        alert(buildJSON("BUY",  sym5, entry5, sl5, tp1_5, tp2_5, tp3_5, atr5, rr5), alert.freq_once_per_bar_close)
+    if sell5 and not na(sl5)
+        alert(buildJSON("SELL", sym5, entry5, sl5, tp1_5, tp2_5, tp3_5, atr5, rr5), alert.freq_once_per_bar_close)
+
+    // Symbol 6
+    if buy6 and not na(sl6)
+        alert(buildJSON("BUY",  sym6, entry6, sl6, tp1_6, tp2_6, tp3_6, atr6, rr6), alert.freq_once_per_bar_close)
+    if sell6 and not na(sl6)
+        alert(buildJSON("SELL", sym6, entry6, sl6, tp1_6, tp2_6, tp3_6, atr6, rr6), alert.freq_once_per_bar_close)
+
+    // Symbol 7
+    if buy7 and not na(sl7)
+        alert(buildJSON("BUY",  sym7, entry7, sl7, tp1_7, tp2_7, tp3_7, atr7, rr7), alert.freq_once_per_bar_close)
+    if sell7 and not na(sl7)
+        alert(buildJSON("SELL", sym7, entry7, sl7, tp1_7, tp2_7, tp3_7, atr7, rr7), alert.freq_once_per_bar_close)
+
+    // Symbol 8
+    if buy8 and not na(sl8)
+        alert(buildJSON("BUY",  sym8, entry8, sl8, tp1_8, tp2_8, tp3_8, atr8, rr8), alert.freq_once_per_bar_close)
+    if sell8 and not na(sl8)
+        alert(buildJSON("SELL", sym8, entry8, sl8, tp1_8, tp2_8, tp3_8, atr8, rr8), alert.freq_once_per_bar_close)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DASHBOARD TABLE
+// ═══════════════════════════════════════════════════════════════════════════
+
+var table dash = table.new(position.top_right, 5, 9, border_width=1)
+
+if barstate.islast
+    // Header
+    table.cell(dash, 0, 0, "Symbol",  bgcolor=color.new(color.gray, 20), text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 0, "Position",bgcolor=color.new(color.gray, 20), text_color=color.white, text_size=size.small)
+    table.cell(dash, 2, 0, "Stop",    bgcolor=color.new(color.gray, 20), text_color=color.white, text_size=size.small)
+    table.cell(dash, 3, 0, "ATR",     bgcolor=color.new(color.gray, 20), text_color=color.white, text_size=size.small)
+    table.cell(dash, 4, 0, "Signal",  bgcolor=color.new(color.gray, 20), text_color=color.white, text_size=size.small)
+
+    // Helper arrays — unrolled per symbol for Pine Script compatibility
+    // Row 1 — Symbol 1
+    table.cell(dash, 0, 1, getCleanTicker(sym1), text_size=size.small)
+    table.cell(dash, 1, 1, pos1 == 1 ? "BULL ▲" : "BEAR ▼", text_color=pos1 == 1 ? color.green : color.red, text_size=size.small)
+    table.cell(dash, 2, 1, str.tostring(stop1, "#.#####"), text_size=size.small)
+    table.cell(dash, 3, 1, str.tostring(atr1, "#.#####"), text_size=size.small)
+    table.cell(dash, 4, 1, buy1 ? "BUY" : sell1 ? "SELL" : "—", text_color=buy1 ? color.green : sell1 ? color.red : color.gray, text_size=size.small)
+
+    // Row 2 — Symbol 2
+    table.cell(dash, 0, 2, getCleanTicker(sym2), text_size=size.small)
+    table.cell(dash, 1, 2, pos2 == 1 ? "BULL ▲" : "BEAR ▼", text_color=pos2 == 1 ? color.green : color.red, text_size=size.small)
+    table.cell(dash, 2, 2, str.tostring(stop2, "#.#####"), text_size=size.small)
+    table.cell(dash, 3, 2, str.tostring(atr2, "#.#####"), text_size=size.small)
+    table.cell(dash, 4, 2, buy2 ? "BUY" : sell2 ? "SELL" : "—", text_color=buy2 ? color.green : sell2 ? color.red : color.gray, text_size=size.small)
+
+    // Row 3 — Symbol 3
+    table.cell(dash, 0, 3, getCleanTicker(sym3), text_size=size.small)
+    table.cell(dash, 1, 3, pos3 == 1 ? "BULL ▲" : "BEAR ▼", text_color=pos3 == 1 ? color.green : color.red, text_size=size.small)
+    table.cell(dash, 2, 3, str.tostring(stop3, "#.#####"), text_size=size.small)
+    table.cell(dash, 3, 3, str.tostring(atr3, "#.#####"), text_size=size.small)
+    table.cell(dash, 4, 3, buy3 ? "BUY" : sell3 ? "SELL" : "—", text_color=buy3 ? color.green : sell3 ? color.red : color.gray, text_size=size.small)
+
+    // Row 4 — Symbol 4
+    table.cell(dash, 0, 4, getCleanTicker(sym4), text_size=size.small)
+    table.cell(dash, 1, 4, pos4 == 1 ? "BULL ▲" : "BEAR ▼", text_color=pos4 == 1 ? color.green : color.red, text_size=size.small)
+    table.cell(dash, 2, 4, str.tostring(stop4, "#.#####"), text_size=size.small)
+    table.cell(dash, 3, 4, str.tostring(atr4, "#.#####"), text_size=size.small)
+    table.cell(dash, 4, 4, buy4 ? "BUY" : sell4 ? "SELL" : "—", text_color=buy4 ? color.green : sell4 ? color.red : color.gray, text_size=size.small)
+
+    // Row 5 — Symbol 5
+    table.cell(dash, 0, 5, getCleanTicker(sym5), text_size=size.small)
+    table.cell(dash, 1, 5, pos5 == 1 ? "BULL ▲" : "BEAR ▼", text_color=pos5 == 1 ? color.green : color.red, text_size=size.small)
+    table.cell(dash, 2, 5, str.tostring(stop5, "#.#####"), text_size=size.small)
+    table.cell(dash, 3, 5, str.tostring(atr5, "#.#####"), text_size=size.small)
+    table.cell(dash, 4, 5, buy5 ? "BUY" : sell5 ? "SELL" : "—", text_color=buy5 ? color.green : sell5 ? color.red : color.gray, text_size=size.small)
+
+    // Row 6 — Symbol 6
+    table.cell(dash, 0, 6, getCleanTicker(sym6), text_size=size.small)
+    table.cell(dash, 1, 6, pos6 == 1 ? "BULL ▲" : "BEAR ▼", text_color=pos6 == 1 ? color.green : color.red, text_size=size.small)
+    table.cell(dash, 2, 6, str.tostring(stop6, "#.#####"), text_size=size.small)
+    table.cell(dash, 3, 6, str.tostring(atr6, "#.#####"), text_size=size.small)
+    table.cell(dash, 4, 6, buy6 ? "BUY" : sell6 ? "SELL" : "—", text_color=buy6 ? color.green : sell6 ? color.red : color.gray, text_size=size.small)
+
+    // Row 7 — Symbol 7
+    table.cell(dash, 0, 7, getCleanTicker(sym7), text_size=size.small)
+    table.cell(dash, 1, 7, pos7 == 1 ? "BULL ▲" : "BEAR ▼", text_color=pos7 == 1 ? color.green : color.red, text_size=size.small)
+    table.cell(dash, 2, 7, str.tostring(stop7, "#.#####"), text_size=size.small)
+    table.cell(dash, 3, 7, str.tostring(atr7, "#.#####"), text_size=size.small)
+    table.cell(dash, 4, 7, buy7 ? "BUY" : sell7 ? "SELL" : "—", text_color=buy7 ? color.green : sell7 ? color.red : color.gray, text_size=size.small)
+
+    // Row 8 — Symbol 8
+    table.cell(dash, 0, 8, getCleanTicker(sym8), text_size=size.small)
+    table.cell(dash, 1, 8, pos8 == 1 ? "BULL ▲" : "BEAR ▼", text_color=pos8 == 1 ? color.green : color.red, text_size=size.small)
+    table.cell(dash, 2, 8, str.tostring(stop8, "#.#####"), text_size=size.small)
+    table.cell(dash, 3, 8, str.tostring(atr8, "#.#####"), text_size=size.small)
+    table.cell(dash, 4, 8, buy8 ? "BUY" : sell8 ? "SELL" : "—", text_color=buy8 ? color.green : sell8 ? color.red : color.gray, text_size=size.small)
+
+// ═══════════════════════════════════════════════════════════════════════════
+// DUMMY PLOT (required — Pine indicators must have at least one output)
+// ═══════════════════════════════════════════════════════════════════════════
+
+plot(0, display=display.none)

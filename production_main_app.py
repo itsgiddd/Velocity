@@ -34,7 +34,7 @@ class ProductionNeuralTradingApp:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("Neural Forex Trader")
+        self.root.title("ACI Trading System")
         self.root.geometry("720x640")
         self.root.resizable(True, True)
 

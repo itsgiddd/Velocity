@@ -1,9 +1,9 @@
 """
-Neural Forex Trading App
-=======================
+ACI Trading System
+==================
 
-Professional neural network-powered forex trading application.
+Professional AI-powered forex trading application.
 """
 
-__version__ = "1.0.0"
-__author__ = "Neural Trading System"
+__version__ = "2.0.0"
+__author__ = "ACI"

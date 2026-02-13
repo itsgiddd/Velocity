@@ -185,6 +185,12 @@ models/
 *.yaml
 *.yml
 
+# ALLOW specific files needed for the app
+!neural_model.pth
+!zeropoint_neural_model.pth
+!flip_predictor_model.pth
+!settings.json
+
 # Trading specific files
 *.trade
 *.signal
@@ -206,8 +212,11 @@ training_data/
 *.model
 *.neural
 *.brain
-model_*.pth
-neural_*.pth
+
+# PyInstaller build output
+build/
+dist/
+*.spec.bak
 
 # Configuration files with sensitive data
 user_config.yaml
@@ -274,3 +283,4 @@ credentials.txt
 secrets.txt
 api_keys.txt
 private_keys.txt
+webhook_config.json
