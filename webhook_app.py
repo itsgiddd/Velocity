@@ -1263,189 +1263,151 @@ class ACiApp(QMainWindow):
 
         main_layout.addLayout(btn_row)
 
-        # --- Row 1: Trade Execution Settings ---
-        settings_group = QGroupBox("Trade Execution")
-        settings_layout = QHBoxLayout(settings_group)
+        # --- Trade Execution Settings (3 rows in one group) ---
+        settings_group = QGroupBox("Trade Execution  —  V4 Profit Capture")
+        settings_main = QVBoxLayout(settings_group)
+        settings_main.setSpacing(6)
 
-        settings_layout.addWidget(QLabel("Risk %:"))
+        # ── Row 1: Core execution params ──
+        row1 = QHBoxLayout()
+        row1.setSpacing(12)
+
+        row1.addWidget(QLabel("Risk %:"))
         self.inp_risk = QLineEdit("30")
         self.inp_risk.setFixedWidth(40)
         self.inp_risk.setToolTip("Risk per trade (30% = half-Kelly for 97.5% WR)")
-        settings_layout.addWidget(self.inp_risk)
+        row1.addWidget(self.inp_risk)
 
-        settings_layout.addWidget(QLabel("Lots:"))
+        row1.addWidget(QLabel("Lots:"))
         self.inp_lots = QLineEdit("0.40")
         self.inp_lots.setFixedWidth(50)
         self.inp_lots.setToolTip("Default lot size (overridden by risk-based sizing)")
-        settings_layout.addWidget(self.inp_lots)
+        row1.addWidget(self.inp_lots)
 
-        settings_layout.addWidget(QLabel("Max:"))
+        row1.addWidget(QLabel("Max:"))
         self.inp_max_trades = QLineEdit("5")
         self.inp_max_trades.setFixedWidth(30)
         self.inp_max_trades.setToolTip("Max concurrent trades across all pairs")
-        settings_layout.addWidget(self.inp_max_trades)
+        row1.addWidget(self.inp_max_trades)
 
-        settings_layout.addWidget(QLabel("Poll (sec):"))
+        row1.addWidget(QLabel("Poll (sec):"))
         self.inp_poll = QLineEdit("30")
         self.inp_poll.setFixedWidth(40)
-        settings_layout.addWidget(self.inp_poll)
+        row1.addWidget(self.inp_poll)
 
-        settings_layout.addWidget(QLabel("Timeframe:"))
+        row1.addWidget(QLabel("Timeframe:"))
         self.combo_tf = QComboBox()
         self.combo_tf.setFixedWidth(70)
         for tf in TIMEFRAMES:
             self.combo_tf.addItem(tf, tf)
         self.combo_tf.setCurrentIndex(5)  # H4 default
         self.combo_tf.currentIndexChanged.connect(self._on_tf_changed)
-        settings_layout.addWidget(self.combo_tf)
+        row1.addWidget(self.combo_tf)
 
-        settings_layout.addStretch()
-        main_layout.addWidget(settings_group)
+        row1.addStretch()
+        settings_main.addLayout(row1)
 
-        # --- Row 2: V4 Profit Capture Settings (editable) ---
-        v4_group = QGroupBox("V4 Profit Capture  —  5-Layer Trade Management")
-        v4_main = QVBoxLayout(v4_group)
-        v4_main.setSpacing(6)
+        # ── Thin separator ──
+        sep_h = QFrame()
+        sep_h.setFrameShape(QFrame.Shape.HLine)
+        sep_h.setStyleSheet("color: #3A352B;")
+        settings_main.addWidget(sep_h)
 
-        # Top row: TP levels + BE
-        v4_row1 = QHBoxLayout()
-        v4_row1.setSpacing(16)
+        # ── Row 2: V4 TPs + Breakeven ──
+        _tp = "color: #4ADE80; font-weight: bold; font-size: 12px;"
+        _be = "color: #FBBF24; font-weight: bold; font-size: 12px;"
+        _mi = "color: #38BDF8; font-weight: bold; font-size: 12px;"
+        _tr = "color: #A78BFA; font-weight: bold; font-size: 12px;"
+        _u = "font-size: 11px;"
 
-        _tp_lbl_style = "color: #4ADE80; font-weight: bold;"
-        _be_lbl_style = "color: #FBBF24; font-weight: bold;"
-        _micro_lbl_style = "color: #38BDF8; font-weight: bold;"
-        _trail_lbl_style = "color: #A78BFA; font-weight: bold;"
-        _val_style = "font-size: 11px;"
+        row2 = QHBoxLayout()
+        row2.setSpacing(12)
 
-        lbl = QLabel("TP1:")
-        lbl.setStyleSheet(_tp_lbl_style)
-        v4_row1.addWidget(lbl)
+        lbl = QLabel("TP1:"); lbl.setStyleSheet(_tp); row2.addWidget(lbl)
         self.inp_tp1 = QLineEdit(str(TP1_MULT_AGG))
         self.inp_tp1.setFixedWidth(40)
-        self.inp_tp1.setToolTip("TP1 distance in ATR multiples (V4 optimized: 0.8)")
-        v4_row1.addWidget(self.inp_tp1)
-        lbl = QLabel("x ATR")
-        lbl.setStyleSheet(_val_style)
-        v4_row1.addWidget(lbl)
+        self.inp_tp1.setToolTip("TP1 distance in ATR multiples (V4: 0.8)")
+        row2.addWidget(self.inp_tp1)
+        lbl = QLabel("x"); lbl.setStyleSheet(_u); row2.addWidget(lbl)
 
-        lbl = QLabel("TP2:")
-        lbl.setStyleSheet(_tp_lbl_style)
-        v4_row1.addWidget(lbl)
+        lbl = QLabel("TP2:"); lbl.setStyleSheet(_tp); row2.addWidget(lbl)
         self.inp_tp2 = QLineEdit(str(TP2_MULT_AGG))
         self.inp_tp2.setFixedWidth(40)
-        self.inp_tp2.setToolTip("TP2 distance in ATR multiples (V4 optimized: 2.0)")
-        v4_row1.addWidget(self.inp_tp2)
-        lbl = QLabel("x ATR")
-        lbl.setStyleSheet(_val_style)
-        v4_row1.addWidget(lbl)
+        self.inp_tp2.setToolTip("TP2 distance in ATR multiples (V4: 2.0)")
+        row2.addWidget(self.inp_tp2)
+        lbl = QLabel("x"); lbl.setStyleSheet(_u); row2.addWidget(lbl)
 
-        lbl = QLabel("TP3:")
-        lbl.setStyleSheet(_tp_lbl_style)
-        v4_row1.addWidget(lbl)
+        lbl = QLabel("TP3:"); lbl.setStyleSheet(_tp); row2.addWidget(lbl)
         self.inp_tp3 = QLineEdit(str(TP3_MULT_AGG))
         self.inp_tp3.setFixedWidth(40)
-        self.inp_tp3.setToolTip("TP3 distance in ATR multiples (V4 optimized: 5.0)")
-        v4_row1.addWidget(self.inp_tp3)
-        lbl = QLabel("x ATR")
-        lbl.setStyleSheet(_val_style)
-        v4_row1.addWidget(lbl)
+        self.inp_tp3.setToolTip("TP3 distance in ATR multiples (V4: 5.0)")
+        row2.addWidget(self.inp_tp3)
+        lbl = QLabel("x ATR"); lbl.setStyleSheet(_u); row2.addWidget(lbl)
 
-        # Separator
-        sep_v = QFrame()
-        sep_v.setFrameShape(QFrame.Shape.VLine)
-        sep_v.setStyleSheet("color: #3D3929;")
-        v4_row1.addWidget(sep_v)
+        sep_v = QFrame(); sep_v.setFrameShape(QFrame.Shape.VLine)
+        sep_v.setStyleSheet("color: #3A352B;"); row2.addWidget(sep_v)
 
-        lbl = QLabel("BE Trigger:")
-        lbl.setStyleSheet(_be_lbl_style)
-        v4_row1.addWidget(lbl)
+        lbl = QLabel("BE:"); lbl.setStyleSheet(_be); row2.addWidget(lbl)
         self.inp_be_trigger = QLineEdit(str(BE_TRIGGER_MULT))
-        self.inp_be_trigger.setFixedWidth(40)
-        self.inp_be_trigger.setToolTip("Move SL to breakeven when price reaches this ATR multiple (0.5 = half ATR)")
-        v4_row1.addWidget(self.inp_be_trigger)
-        lbl = QLabel("x ATR")
-        lbl.setStyleSheet(_val_style)
-        v4_row1.addWidget(lbl)
+        self.inp_be_trigger.setFixedWidth(36)
+        self.inp_be_trigger.setToolTip("Move SL to breakeven at this ATR multiple (0.5)")
+        row2.addWidget(self.inp_be_trigger)
+        lbl = QLabel("x"); lbl.setStyleSheet(_u); row2.addWidget(lbl)
 
-        lbl = QLabel("Buffer:")
-        lbl.setStyleSheet(_be_lbl_style)
-        v4_row1.addWidget(lbl)
+        lbl = QLabel("Buf:"); lbl.setStyleSheet(_be); row2.addWidget(lbl)
         self.inp_be_buffer = QLineEdit(str(BE_BUFFER_MULT))
-        self.inp_be_buffer.setFixedWidth(40)
-        self.inp_be_buffer.setToolTip("BE SL is set to entry + buffer (0.15 = slight profit on BE)")
-        v4_row1.addWidget(self.inp_be_buffer)
-        lbl = QLabel("x ATR")
-        lbl.setStyleSheet(_val_style)
-        v4_row1.addWidget(lbl)
+        self.inp_be_buffer.setFixedWidth(36)
+        self.inp_be_buffer.setToolTip("BE SL set to entry + buffer (0.15 = slight profit)")
+        row2.addWidget(self.inp_be_buffer)
+        lbl = QLabel("x ATR"); lbl.setStyleSheet(_u); row2.addWidget(lbl)
 
-        v4_row1.addStretch()
-        v4_main.addLayout(v4_row1)
+        row2.addStretch()
+        settings_main.addLayout(row2)
 
-        # Bottom row: Micro-partial + Stall + Trail + live status
-        v4_row2 = QHBoxLayout()
-        v4_row2.setSpacing(16)
+        # ── Row 3: Micro-partial + Stall + Trail + live status ──
+        row3 = QHBoxLayout()
+        row3.setSpacing(12)
 
-        lbl = QLabel("Micro-TP:")
-        lbl.setStyleSheet(_micro_lbl_style)
-        v4_row2.addWidget(lbl)
+        lbl = QLabel("Micro:"); lbl.setStyleSheet(_mi); row3.addWidget(lbl)
         self.inp_micro_tp = QLineEdit(str(MICRO_TP_MULT))
-        self.inp_micro_tp.setFixedWidth(40)
+        self.inp_micro_tp.setFixedWidth(36)
         self.inp_micro_tp.setToolTip("Take micro-partial at this ATR distance (0.8x)")
-        v4_row2.addWidget(self.inp_micro_tp)
-        lbl = QLabel("x ATR")
-        lbl.setStyleSheet(_val_style)
-        v4_row2.addWidget(lbl)
+        row3.addWidget(self.inp_micro_tp)
+        lbl = QLabel("x ATR"); lbl.setStyleSheet(_u); row3.addWidget(lbl)
 
-        lbl = QLabel("Take:")
-        lbl.setStyleSheet(_micro_lbl_style)
-        v4_row2.addWidget(lbl)
+        lbl = QLabel("Take:"); lbl.setStyleSheet(_mi); row3.addWidget(lbl)
         self.inp_micro_pct = QLineEdit(str(int(MICRO_TP_PCT * 100)))
         self.inp_micro_pct.setFixedWidth(30)
         self.inp_micro_pct.setToolTip("Percent of lot to close at micro-TP (15%)")
-        v4_row2.addWidget(self.inp_micro_pct)
-        lbl = QLabel("%")
-        lbl.setStyleSheet(_val_style)
-        v4_row2.addWidget(lbl)
+        row3.addWidget(self.inp_micro_pct)
+        lbl = QLabel("%"); lbl.setStyleSheet(_u); row3.addWidget(lbl)
 
-        sep_v2 = QFrame()
-        sep_v2.setFrameShape(QFrame.Shape.VLine)
-        sep_v2.setStyleSheet("color: #3D3929;")
-        v4_row2.addWidget(sep_v2)
+        sep_v2 = QFrame(); sep_v2.setFrameShape(QFrame.Shape.VLine)
+        sep_v2.setStyleSheet("color: #3A352B;"); row3.addWidget(sep_v2)
 
-        lbl = QLabel("Stall:")
-        lbl.setStyleSheet(_trail_lbl_style)
-        v4_row2.addWidget(lbl)
+        lbl = QLabel("Stall:"); lbl.setStyleSheet(_tr); row3.addWidget(lbl)
         self.inp_stall = QLineEdit(str(STALL_BARS))
         self.inp_stall.setFixedWidth(30)
         self.inp_stall.setToolTip("Move SL to BE after this many H4 bars without TP1 (6)")
-        v4_row2.addWidget(self.inp_stall)
-        lbl = QLabel("bars")
-        lbl.setStyleSheet(_val_style)
-        v4_row2.addWidget(lbl)
+        row3.addWidget(self.inp_stall)
+        lbl = QLabel("bars"); lbl.setStyleSheet(_u); row3.addWidget(lbl)
 
-        lbl = QLabel("Trail:")
-        lbl.setStyleSheet(_trail_lbl_style)
-        v4_row2.addWidget(lbl)
+        lbl = QLabel("Trail:"); lbl.setStyleSheet(_tr); row3.addWidget(lbl)
         self.inp_trail = QLineEdit(str(PROFIT_TRAIL_DISTANCE_MULT))
-        self.inp_trail.setFixedWidth(40)
+        self.inp_trail.setFixedWidth(36)
         self.inp_trail.setToolTip("Post-TP1 trailing SL distance in ATR multiples (0.8)")
-        v4_row2.addWidget(self.inp_trail)
-        lbl = QLabel("x ATR")
-        lbl.setStyleSheet(_val_style)
-        v4_row2.addWidget(lbl)
+        row3.addWidget(self.inp_trail)
+        lbl = QLabel("x ATR"); lbl.setStyleSheet(_u); row3.addWidget(lbl)
 
-        sep_v3 = QFrame()
-        sep_v3.setFrameShape(QFrame.Shape.VLine)
-        sep_v3.setStyleSheet("color: #3D3929;")
-        v4_row2.addWidget(sep_v3)
+        sep_v3 = QFrame(); sep_v3.setFrameShape(QFrame.Shape.VLine)
+        sep_v3.setStyleSheet("color: #3A352B;"); row3.addWidget(sep_v3)
 
-        # Live V4 status
-        self.lbl_v4_active = QLabel("V4: Waiting for trades...")
+        self.lbl_v4_active = QLabel("V4: Waiting...")
         self.lbl_v4_active.setStyleSheet("font-weight: bold; font-size: 12px; color: #6B6355;")
-        v4_row2.addWidget(self.lbl_v4_active)
+        row3.addWidget(self.lbl_v4_active)
 
-        v4_row2.addStretch()
-        v4_main.addLayout(v4_row2)
+        row3.addStretch()
+        settings_main.addLayout(row3)
 
         # Live-update V4 params when any field changes
         for inp in (self.inp_tp1, self.inp_tp2, self.inp_tp3,
@@ -1454,7 +1416,7 @@ class ACiApp(QMainWindow):
                     self.inp_stall, self.inp_trail):
             inp.editingFinished.connect(self._push_v4_params)
 
-        main_layout.addWidget(v4_group)
+        main_layout.addWidget(settings_group)
 
         # --- Pairs ---
         pairs_group = QGroupBox("Trading Pairs")
