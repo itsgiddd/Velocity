@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple
 import threading
 
-from push_structure_analyzer import SymbolPushProfile
+from models.push_structure_analyzer import SymbolPushProfile
 
 class SimpleNeuralNetwork(nn.Module):
     """Simple neural network for forex prediction"""

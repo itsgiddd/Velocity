@@ -167,65 +167,62 @@ Models save as `.pth` files in the project root. The app auto-detects `zeropoint
 ## Project Structure
 
 ```
-trading_app.py                    # Main PySide6 dark-themed trading app
-webhook_app.py                    # ACi webhook receiver (alternative to MT5 direct)
+README.md                              # This file — V4 research + full docs
 
-app/
-  trading_engine.py               # Core trading loop + position management
-  zeropoint_signal.py             # ZeroPoint ATR trailing stop + V4 constants
-  model_manager.py                # Neural model load / inference
-  mt5_connector.py                # MetaTrader 5 connection
-  config_manager.py               # YAML config handling
+app/                                   # Core runtime library
+  trading_engine.py                    # Trading loop + position management
+  zeropoint_signal.py                  # ZeroPoint ATR trailing stop + V4 constants
+  model_manager.py                     # Neural model load / inference
+  mt5_connector.py                     # MetaTrader 5 connection
+  config_manager.py                    # YAML config handling
 
-# --- Neural Models ---
-simple_neural_trainer.py          # Standard neural trainer (47-dim)
-zeropoint_neural_trainer.py       # ZeroPoint-aware trainer (62-dim)
-flip_predictor_model.py           # FlipPredictor GRU architecture
-flip_predictor_features.py        # 45-dim H4 feature extraction
-flip_predictor_trainer.py         # FlipPredictor training pipeline
-flip_predictor_inference.py       # FlipPredictor live inference engine
-flip_predictor_integration.py     # Decision maker: skip/reduce/boost signals
+models/                                # Neural architectures + analysis libs
+  flip_predictor_model.py              # FlipPredictor GRU (~254K params)
+  flip_predictor_features.py           # 45-dim H4 feature extraction
+  flip_predictor_inference.py          # Live inference engine
+  flip_predictor_integration.py        # Decision maker: skip/reduce/boost
+  push_structure_analyzer.py           # Swing detection + push exhaustion
+  pattern_recognition.py               # Chart pattern detection (forming + completed)
 
-# --- Analysis & Patterns ---
-pattern_recognition.py            # Chart pattern detection (forming + completed)
-push_structure_analyzer.py        # Swing detection + push exhaustion profiling
-ai_brain.py                       # Rule-based trade decision engine
-trade_validator.py                # Trade validation rules
+training/                              # Model trainers
+  simple_neural_trainer.py             # Standard neural trainer (47-dim)
+  zeropoint_neural_trainer.py          # ZeroPoint-aware trainer (62-dim)
+  flip_predictor_trainer.py            # FlipPredictor GRU trainer
+  council_trainer.py                   # Council predictor trainer
 
-# --- Risk & Position Sizing ---
-adaptive_risk.py                  # Dynamic risk adjustment
+agentic/                               # Self-learning system
+  agentic_orchestrator.py              # Background daemon wiring all components
+  adaptive_performance_monitor.py      # Degradation detection
+  warm_start_retrainer.py              # Warm-start model retraining
+  model_hot_swap.py                    # Atomic model swap + 20-trade probation
+  trade_journal.py                     # SQLite trade logging
+  launch_agentic_trader.py             # Headless launcher (no UI)
 
-# --- Self-Learning System ---
-agentic_orchestrator.py           # Background daemon wiring all components
-adaptive_performance_monitor.py   # Degradation detection
-warm_start_retrainer.py           # Warm-start model retraining
-model_hot_swap.py                 # Atomic model swap + 20-trade probation
-trade_journal.py                  # SQLite trade logging
-launch_agentic_trader.py          # Headless launcher (no UI)
+candle_intelligence/                   # Trading council (15 AI agents)
+  trading_council.py                   # Council deliberation engine
+  agent_base.py                        # Base agent class
+  council_predictor.py                 # ML model for council consensus
+  agents/                              # 15 specialized agents
 
-# --- Trading Council (15 AI Agents) ---
-candle_intelligence/
-  trading_council.py              # Council deliberation engine
-  agent_base.py                   # Base agent class
-  agents/                         # 15 specialized agents (candle, trend, volume, risk)
-  council_predictor.py            # ML model for council consensus
+backtests/                             # Backtesting + analysis + projections
+  backtest_zp_profitability.py         # Core V4 backtest engine
+  backtest_filter.py                   # Risk scoring filter backtest
+  backtest_probation.py                # Probation period entry testing
+  backtest_risk_normalized.py          # Risk-normalized lot sizing
+  optimize_v4.py                       # V4 parameter grid search
+  projection_realistic.py              # R-multiple based 1-year projection
+  projection_doubling.py               # Doubling milestone tracker
+  analyze_losers.py                    # Loser DNA profiler
+  simulate_200_account.py              # $200 account growth simulation
 
-# --- Backtests & Projections ---
-backtest_zp_profitability.py      # Core V4 backtest engine
-backtest_council.py               # Council baseline vs protect comparison
-council_trainer.py                # Full simulation pipeline
-projection_realistic.py           # R-multiple based 1-year projection
-projection_doubling.py            # Doubling milestone tracker
-backtest_risk_normalized.py       # Risk-normalized lot sizing backtest
-backtest_probation.py             # Probation period entry testing
+scripts/                               # Entry points + CLI tools
+  trading_app.py                       # Main PySide6 dark-themed trading app
+  webhook_app.py                       # ACi webhook receiver + live charts
+  build.bat                            # PyInstaller build script
 
-# --- Live Scanning ---
-zp_scan.py                        # Scan all pairs for current ZP signals
-zp_trade_now.py                   # Quick CLI: scan + place best ZP trade
-zeropoint_backtest.py             # Historical ZP signal backtest
-
-# --- Pine Script ---
-zeropoint_multi_scanner.pine      # TradingView indicator overlay
+pine/                                  # TradingView Pine Script
+  zeropoint_multi_scanner.pine         # Multi-pair ZeroPoint scanner overlay
+  zeropoint_v4_strategy.pine           # V4 strategy with profit capture
 ```
 
 ---

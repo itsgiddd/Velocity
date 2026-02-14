@@ -175,7 +175,6 @@ cython_debug/
 # Custom Neural Forex Trading App Ignore
 logs/
 config/
-models/
 *.pth
 *.pkl
 *.h5
