@@ -31,7 +31,14 @@ import MetaTrader5 as mt5
 from lightweight_charts.widgets import QtChart
 
 from app.zeropoint_signal import compute_zeropoint_state, ATR_PERIOD, ATR_MULTIPLIER
-from app.zeropoint_signal import TP1_MULT, TP2_MULT, TP3_MULT
+from app.zeropoint_signal import TP1_MULT, TP2_MULT, TP3_MULT  # baseline (unused)
+from app.zeropoint_signal import (
+    TP1_MULT_AGG, TP2_MULT_AGG, TP3_MULT_AGG,       # V4 optimized TPs
+    BE_TRIGGER_MULT, BE_BUFFER_MULT,                   # Early breakeven
+    PROFIT_TRAIL_DISTANCE_MULT,                        # Post-TP1 trailing
+    STALL_BARS,                                        # Stall exit
+    MICRO_TP_MULT, MICRO_TP_PCT,                       # Micro-partial
+)
 
 # ---------------------------------------------------------------------------
 # Crash handler
@@ -78,10 +85,11 @@ TIMEFRAMES = list(TF_MAP.keys())
 MAGIC_NUMBER = 234567
 SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "aci_settings.json")
 
-# TP partial close splits (40% at TP1, 30% at TP2, close rest at TP3)
-TP1_CLOSE_PCT = 0.40
-TP2_CLOSE_PCT = 0.30   # of original
+# V4 partial close splits (1/3 at TP1, 1/3 at TP2, close rest at TP3)
+TP1_CLOSE_PCT = 0.33
+TP2_CLOSE_PCT = 0.33   # of original
 TP3_CLOSE_PCT = 1.00   # close remaining
+MICRO_CLOSE_PCT = MICRO_TP_PCT  # 15% micro-partial at 0.8x ATR
 
 # Margin safety — require at least this % free margin after trade
 MIN_MARGIN_LEVEL_PCT = 150   # 150% margin level = safe zone
@@ -708,15 +716,15 @@ class ScanEngine(QObject):
         if sl_val is None or atr_val is None:
             return
 
-        # TP levels based on original signal
+        # V4 optimized TP levels
         if direction == "BUY":
-            tp1 = entry_price + atr_val * TP1_MULT
-            tp2 = entry_price + atr_val * TP2_MULT
-            tp3 = entry_price + atr_val * TP3_MULT
+            tp1 = entry_price + atr_val * TP1_MULT_AGG
+            tp2 = entry_price + atr_val * TP2_MULT_AGG
+            tp3 = entry_price + atr_val * TP3_MULT_AGG
         else:
-            tp1 = entry_price - atr_val * TP1_MULT
-            tp2 = entry_price - atr_val * TP2_MULT
-            tp3 = entry_price - atr_val * TP3_MULT
+            tp1 = entry_price - atr_val * TP1_MULT_AGG
+            tp2 = entry_price - atr_val * TP2_MULT_AGG
+            tp3 = entry_price - atr_val * TP3_MULT_AGG
 
         # R:R check
         sl_dist = abs(entry_price - sl_val)
@@ -792,34 +800,45 @@ class ScanEngine(QObject):
 
 
 # ---------------------------------------------------------------------------
-# TP Manager — monitors positions, partial-closes at TP1/TP2/TP3
+# V4 TP Manager — Full 5-layer profit capture system
+# Layers: Micro-Partial | Early BE | Tighter TPs | Post-TP1 Trail | Stall Exit
 # ---------------------------------------------------------------------------
 class TPManager(QObject):
-    """Background TP manager: partial-close positions at TP1, TP2, TP3."""
+    """V4 Trade Manager: 5-layer profit capture matching backtested system."""
 
     log_message = Signal(str)
 
     def __init__(self):
         super().__init__()
         self._running = False
-        # Track which TPs have been hit per ticket: {ticket: {"tp1": bool, "tp2": bool, ...}}
-        self._tp_state = {}
-        # Store trade info: {ticket: {direction, entry, sl, tp1, tp2, tp3, original_lot}}
-        self._trade_info = {}
+        self._trade_info = {}   # {ticket: {direction, entry, sl, atr, tp1-3, original_lot}}
+        self._tp_state = {}     # {ticket: {tp1, tp2, tp3, micro_tp, be_activated, stall_be, ...}}
 
-    def register_trade(self, ticket, direction, entry, sl, tp1, tp2, tp3, original_lot):
-        """Register a new trade for TP management."""
+    def register_trade(self, ticket, direction, entry, sl, tp1, tp2, tp3, atr_val, original_lot):
+        """Register a new trade for V4 profit capture management."""
         self._trade_info[ticket] = {
             "direction": direction,
             "entry": entry,
             "sl": sl,
+            "atr": atr_val,
             "tp1": tp1,
             "tp2": tp2,
             "tp3": tp3,
             "original_lot": original_lot,
         }
-        self._tp_state[ticket] = {"tp1": False, "tp2": False, "tp3": False}
-        self.log_message.emit(f"  TP Manager: tracking ticket #{ticket} | TP1={tp1:.5f} TP2={tp2:.5f} TP3={tp3:.5f}")
+        self._tp_state[ticket] = {
+            "tp1": False, "tp2": False, "tp3": False,
+            "micro_tp": False,           # Micro-partial at MICRO_TP_MULT * ATR
+            "be_activated": False,       # Early BE at BE_TRIGGER_MULT * ATR
+            "stall_be": False,           # Stall exit after STALL_BARS checks
+            "profit_trail_sl": None,     # Post-TP1 trailing SL
+            "max_favorable": entry,      # Best price seen
+            "checks": 0,                 # ~bars since entry (each check = 2s, H4 = 14400s)
+        }
+        self.log_message.emit(
+            f"  V4 Manager: #{ticket} | TP1={tp1:.5f} TP2={tp2:.5f} TP3={tp3:.5f} | "
+            f"BE@{BE_TRIGGER_MULT}x Stall@{STALL_BARS}bars Trail@{PROFIT_TRAIL_DISTANCE_MULT}x"
+        )
 
     def start(self):
         self._running = True
@@ -832,17 +851,17 @@ class TPManager(QObject):
     def _monitor_loop(self):
         while self._running:
             try:
-                self._check_tp_levels()
+                self._check_positions()
             except Exception as e:
-                self.log_message.emit(f"TP Manager error: {e}")
+                self.log_message.emit(f"V4 Manager error: {e}")
             _time.sleep(2)
 
-    def _check_tp_levels(self):
+    def _check_positions(self):
         positions = mt5.positions_get()
         if not positions:
             return
 
-        # Clean up closed trades from tracking
+        # Clean up closed trades
         open_tickets = {p.ticket for p in positions}
         closed = [t for t in self._trade_info if t not in open_tickets]
         for t in closed:
@@ -852,82 +871,173 @@ class TPManager(QObject):
         for pos in positions:
             if pos.magic != MAGIC_NUMBER:
                 continue
-
             ticket = pos.ticket
             if ticket not in self._trade_info:
-                # Trade not registered (might be from before app started) — skip
                 continue
 
             info = self._trade_info[ticket]
             state = self._tp_state[ticket]
             current = pos.price_current
             direction = info["direction"]
+            entry = info["entry"]
+            atr = info["atr"]
             original_lot = info["original_lot"]
-            vol_min = None
+            is_buy = direction == "BUY"
 
-            # Check TP1
+            sym_info = mt5.symbol_info(pos.symbol)
+            if not sym_info:
+                continue
+
+            state["checks"] += 1
+
+            # Track max favorable price
+            if is_buy:
+                if current > state["max_favorable"]:
+                    state["max_favorable"] = current
+                cur_profit_dist = current - entry
+            else:
+                if current < state["max_favorable"]:
+                    state["max_favorable"] = current
+                cur_profit_dist = entry - current
+
+            max_profit_dist = abs(state["max_favorable"] - entry)
+
+            # ── Layer 1: Micro-Partial at MICRO_TP_MULT * ATR (0.8x) ──
+            if not state["micro_tp"] and not state["tp1"]:
+                micro_level = entry + (MICRO_TP_MULT * atr if is_buy else -MICRO_TP_MULT * atr)
+                micro_hit = (is_buy and current >= micro_level) or (not is_buy and current <= micro_level)
+                if micro_hit:
+                    close_lot = round(original_lot * MICRO_CLOSE_PCT, 2)
+                    vol_step = sym_info.volume_step
+                    vol_min = sym_info.volume_min
+                    close_lot = max(vol_min, round(close_lot / vol_step) * vol_step)
+                    close_lot = min(close_lot, pos.volume)
+                    if close_lot >= vol_min:
+                        ok = self._partial_close(pos, close_lot, sym_info)
+                        if ok:
+                            state["micro_tp"] = True
+                            self.log_message.emit(
+                                f"  MICRO-TP: {pos.symbol} closed {close_lot:.2f}L "
+                                f"@ {current:.5f} ({MICRO_TP_MULT}x ATR)")
+
+            # ── Layer 2: Early BE at BE_TRIGGER_MULT * ATR (0.5x) ──
+            if not state["be_activated"]:
+                if max_profit_dist >= BE_TRIGGER_MULT * atr:
+                    be_level = entry + (BE_BUFFER_MULT * atr if is_buy else -BE_BUFFER_MULT * atr)
+                    # Only move SL if it improves (tighter)
+                    should_move = (is_buy and be_level > pos.sl) or (not is_buy and be_level < pos.sl)
+                    if should_move:
+                        ok = self._move_sl(pos, be_level, sym_info)
+                        if ok:
+                            state["be_activated"] = True
+                            self.log_message.emit(
+                                f"  EARLY BE: {pos.symbol} SL -> {be_level:.5f} "
+                                f"(entry+{BE_BUFFER_MULT}x ATR)")
+
+            # ── Layer 3: Stall Exit — move to BE after STALL_BARS checks w/o TP1 ──
+            # Each check is ~2s. H4 bar = 14400s = 7200 checks.
+            # STALL_BARS=6 means 6 H4 bars = 43200 checks at 2s interval.
+            # But we approximate: check every ~30 min of real time (900 checks = 30 min)
+            # Actually, STALL_BARS refers to H4 bars. At 2s polling, 6 H4 bars = 6*4*3600/2 = 43200 checks.
+            # For practical purposes, count actual H4 bars by checking elapsed time.
+            if not state["tp1"] and not state["stall_be"]:
+                # Approximate bars: each check is 2s, H4 bar = 14400s
+                approx_bars = state["checks"] * 2 / 14400
+                if approx_bars >= STALL_BARS:
+                    be_level = entry + (BE_BUFFER_MULT * atr if is_buy else -BE_BUFFER_MULT * atr)
+                    should_move = (is_buy and be_level > pos.sl) or (not is_buy and be_level < pos.sl)
+                    if should_move:
+                        ok = self._move_sl(pos, be_level, sym_info)
+                        if ok:
+                            state["stall_be"] = True
+                            state["be_activated"] = True
+                            self.log_message.emit(
+                                f"  STALL EXIT: {pos.symbol} SL -> BE after ~{approx_bars:.1f} bars w/o TP1")
+
+            # ── Layer 4: TP1 Hit — partial close + activate profit trail ──
             if not state["tp1"]:
-                hit = (direction == "BUY" and current >= info["tp1"]) or \
-                      (direction == "SELL" and current <= info["tp1"])
+                hit = (is_buy and current >= info["tp1"]) or (not is_buy and current <= info["tp1"])
                 if hit:
                     close_lot = round(original_lot * TP1_CLOSE_PCT, 2)
-                    sym_info = mt5.symbol_info(pos.symbol)
-                    if sym_info:
-                        vol_min = sym_info.volume_min
-                        vol_step = sym_info.volume_step
-                        close_lot = max(vol_min, round(close_lot / vol_step) * vol_step)
-                        close_lot = min(close_lot, pos.volume)  # can't close more than open
-                        if close_lot >= vol_min:
-                            ok = self._partial_close(pos, close_lot, sym_info)
-                            if ok:
-                                state["tp1"] = True
-                                # Move SL to breakeven
-                                self._move_sl_to_be(pos, info["entry"], sym_info)
-                                self.log_message.emit(
-                                    f"  TP1 HIT: {pos.symbol} closed {close_lot:.2f}L "
-                                    f"@ {current:.5f} | SL -> BE")
-
-            # Check TP2
-            elif not state["tp2"]:
-                hit = (direction == "BUY" and current >= info["tp2"]) or \
-                      (direction == "SELL" and current <= info["tp2"])
-                if hit:
-                    # Get refreshed position volume
+                    vol_step = sym_info.volume_step
+                    vol_min = sym_info.volume_min
+                    close_lot = max(vol_min, round(close_lot / vol_step) * vol_step)
+                    # Refresh volume (micro-partial may have reduced it)
                     refreshed = mt5.positions_get(ticket=ticket)
-                    if refreshed and len(refreshed) > 0:
-                        cur_vol = refreshed[0].volume
-                    else:
-                        continue  # position might be closed
-                    close_lot = round(original_lot * TP2_CLOSE_PCT, 2)
-                    sym_info = mt5.symbol_info(pos.symbol)
-                    if sym_info:
-                        vol_min = sym_info.volume_min
-                        vol_step = sym_info.volume_step
-                        close_lot = max(vol_min, round(close_lot / vol_step) * vol_step)
-                        close_lot = min(close_lot, cur_vol)
-                        if close_lot >= vol_min:
-                            ok = self._partial_close(pos, close_lot, sym_info)
-                            if ok:
-                                state["tp2"] = True
-                                # Trail SL to TP1 level
-                                self._move_sl(pos, info["tp1"], sym_info)
-                                self.log_message.emit(
-                                    f"  TP2 HIT: {pos.symbol} closed {close_lot:.2f}L "
-                                    f"@ {current:.5f} | SL -> TP1 ({info['tp1']:.5f})")
+                    cur_vol = refreshed[0].volume if refreshed and len(refreshed) > 0 else pos.volume
+                    close_lot = min(close_lot, cur_vol)
+                    if close_lot >= vol_min:
+                        ok = self._partial_close(pos, close_lot, sym_info)
+                        if ok:
+                            state["tp1"] = True
+                            # Move SL to BE if not already
+                            if not state["be_activated"]:
+                                be_level = entry + (BE_BUFFER_MULT * atr if is_buy else -BE_BUFFER_MULT * atr)
+                                self._move_sl(pos, be_level, sym_info)
+                                state["be_activated"] = True
+                            self.log_message.emit(
+                                f"  TP1 HIT: {pos.symbol} closed {close_lot:.2f}L "
+                                f"@ {current:.5f} | Trail activated")
 
-            # Check TP3
-            elif not state["tp3"]:
-                hit = (direction == "BUY" and current >= info["tp3"]) or \
-                      (direction == "SELL" and current <= info["tp3"])
+            # ── Layer 5: Post-TP1 Profit Trail ──
+            if state["tp1"] and not state["tp3"]:
+                trail_dist = PROFIT_TRAIL_DISTANCE_MULT * atr
+                if is_buy:
+                    new_trail = state["max_favorable"] - trail_dist
+                    if new_trail > entry and (state["profit_trail_sl"] is None or new_trail > state["profit_trail_sl"]):
+                        state["profit_trail_sl"] = new_trail
+                        # Move SL to trail level
+                        if new_trail > pos.sl:
+                            ok = self._move_sl(pos, new_trail, sym_info)
+                            if ok:
+                                self.log_message.emit(
+                                    f"  TRAIL: {pos.symbol} SL -> {new_trail:.5f} "
+                                    f"(peak={state['max_favorable']:.5f} - {PROFIT_TRAIL_DISTANCE_MULT}x ATR)")
+                else:
+                    new_trail = state["max_favorable"] + trail_dist
+                    if new_trail < entry and (state["profit_trail_sl"] is None or new_trail < state["profit_trail_sl"]):
+                        state["profit_trail_sl"] = new_trail
+                        if new_trail < pos.sl:
+                            ok = self._move_sl(pos, new_trail, sym_info)
+                            if ok:
+                                self.log_message.emit(
+                                    f"  TRAIL: {pos.symbol} SL -> {new_trail:.5f} "
+                                    f"(peak={state['max_favorable']:.5f} + {PROFIT_TRAIL_DISTANCE_MULT}x ATR)")
+
+            # ── TP2: partial close + tighten trail ──
+            if state["tp1"] and not state["tp2"]:
+                hit = (is_buy and current >= info["tp2"]) or (not is_buy and current <= info["tp2"])
                 if hit:
-                    # Close remaining position entirely
                     refreshed = mt5.positions_get(ticket=ticket)
                     if refreshed and len(refreshed) > 0:
                         cur_vol = refreshed[0].volume
                     else:
                         continue
-                    sym_info = mt5.symbol_info(pos.symbol)
-                    if sym_info and cur_vol > 0:
+                    close_lot = round(original_lot * TP2_CLOSE_PCT, 2)
+                    vol_step = sym_info.volume_step
+                    vol_min = sym_info.volume_min
+                    close_lot = max(vol_min, round(close_lot / vol_step) * vol_step)
+                    close_lot = min(close_lot, cur_vol)
+                    if close_lot >= vol_min:
+                        ok = self._partial_close(pos, close_lot, sym_info)
+                        if ok:
+                            state["tp2"] = True
+                            # Move SL to TP1 level
+                            self._move_sl(pos, info["tp1"], sym_info)
+                            self.log_message.emit(
+                                f"  TP2 HIT: {pos.symbol} closed {close_lot:.2f}L "
+                                f"@ {current:.5f} | SL -> TP1")
+
+            # ── TP3: close everything ──
+            if state["tp2"] and not state["tp3"]:
+                hit = (is_buy and current >= info["tp3"]) or (not is_buy and current <= info["tp3"])
+                if hit:
+                    refreshed = mt5.positions_get(ticket=ticket)
+                    if refreshed and len(refreshed) > 0:
+                        cur_vol = refreshed[0].volume
+                    else:
+                        continue
+                    if cur_vol > 0:
                         ok = self._partial_close(pos, cur_vol, sym_info)
                         if ok:
                             state["tp3"] = True
@@ -1126,7 +1236,7 @@ class ACiApp(QMainWindow):
         settings_layout = QHBoxLayout(settings_group)
 
         settings_layout.addWidget(QLabel("Risk %:"))
-        self.inp_risk = QLineEdit("8")
+        self.inp_risk = QLineEdit("30")
         self.inp_risk.setFixedWidth(40)
         settings_layout.addWidget(self.inp_risk)
 
@@ -1237,7 +1347,7 @@ class ACiApp(QMainWindow):
 
             symbols = [s for s, cb in self.pair_checks.items() if cb.isChecked()]
             poll = int(self.inp_poll.text() or "30")
-            risk = float(self.inp_risk.text() or "8") / 100
+            risk = float(self.inp_risk.text() or "30") / 100
             lots = float(self.inp_lots.text() or "0.40")
             max_trades = int(self.inp_max_trades.text() or "5")
 
@@ -1287,7 +1397,7 @@ class ACiApp(QMainWindow):
 
         tf_key = self.combo_tf.currentData()
         poll = int(self.inp_poll.text() or "30")
-        risk = float(self.inp_risk.text() or "8") / 100
+        risk = float(self.inp_risk.text() or "30") / 100
         lots = float(self.inp_lots.text() or "0.40")
         max_trades = int(self.inp_max_trades.text() or "5")
 
@@ -1344,11 +1454,11 @@ class ACiApp(QMainWindow):
         self._log(f"*** SIGNAL: {direction} {symbol} @ {entry:.5f} "
                   f"SL={sl:.5f} TP1={tp1:.5f} TP2={tp2:.5f} TP3={tp3:.5f} ***")
 
-        # Register with TP Manager if trading is enabled
-        # Find the matching open position ticket
+        # Register with V4 TP Manager if trading is enabled
+        # Find the matching open position ticket (delay 3s for MT5 to register)
         if self._trading_enabled:
             QTimer.singleShot(3000, lambda: self._register_trade_for_tp(
-                symbol, direction, entry, sl, tp1, tp2, tp3))
+                symbol, direction, entry, sl, tp1, tp2, tp3, atr))
 
         # Draw SL/TP levels on chart
         if symbol in self.chart_objects:
@@ -1371,8 +1481,8 @@ class ACiApp(QMainWindow):
             except Exception as e:
                 self._log(f"[{symbol}] Level draw error: {e}")
 
-    def _register_trade_for_tp(self, symbol, direction, entry, sl, tp1, tp2, tp3):
-        """Find the just-placed trade ticket and register it with TP manager."""
+    def _register_trade_for_tp(self, symbol, direction, entry, sl, tp1, tp2, tp3, atr_val):
+        """Find the just-placed trade ticket and register it with V4 TP manager."""
         try:
             positions = mt5.positions_get()
             if not positions:
@@ -1384,7 +1494,7 @@ class ACiApp(QMainWindow):
                     # Check it's not already tracked
                     if pos.ticket not in self._tp_manager._trade_info:
                         self._tp_manager.register_trade(
-                            pos.ticket, direction, entry, sl, tp1, tp2, tp3, pos.volume)
+                            pos.ticket, direction, entry, sl, tp1, tp2, tp3, atr_val, pos.volume)
                         return
         except Exception as e:
             self._log(f"TP registration error: {e}")
@@ -1765,7 +1875,7 @@ class ACiApp(QMainWindow):
         try:
             with open(SETTINGS_PATH, "r") as f:
                 s = json.load(f)
-            self.inp_risk.setText(s.get("risk", "8"))
+            self.inp_risk.setText(s.get("risk", "30"))
             self.inp_lots.setText(s.get("lots", "0.40"))
             self.inp_max_trades.setText(s.get("max_trades", "5"))
             self.inp_poll.setText(s.get("poll_sec", "30"))
