@@ -1169,13 +1169,13 @@ class TradingApp(QMainWindow):
                                 key = f"{grp}_{sig.direction}"
                                 corr_counts[key] = corr_counts.get(key, 0) + 1
 
-                        # Place signals with correlation-adjusted lots
+                        # Place signals with risk scoring + correlation adjustment
                         if signals:
                             self._log(f"Placing {len(signals)} trade(s)...")
                             for sig, sym_resolved in signals:
                                 lot = self._calc_lot_size(sig, sym_resolved, use_fixed, fixed_lot, risk_pct)
 
-                                # If 3+ correlated pairs in same direction, reduce lot by 30%
+                                # Correlation filter — reduce lot if correlated pairs signal same direction
                                 norm = sym_resolved.upper().replace(".", "").replace("#", "").replace(".RAW", "")
                                 corr_reduction = 1.0
                                 for grp in _get_correlation_group(norm):

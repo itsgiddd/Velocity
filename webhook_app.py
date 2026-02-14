@@ -31,7 +31,14 @@ import MetaTrader5 as mt5
 from lightweight_charts.widgets import QtChart
 
 from app.zeropoint_signal import compute_zeropoint_state, ATR_PERIOD, ATR_MULTIPLIER
-from app.zeropoint_signal import TP1_MULT, TP2_MULT, TP3_MULT
+from app.zeropoint_signal import TP1_MULT, TP2_MULT, TP3_MULT  # baseline (unused)
+from app.zeropoint_signal import (
+    TP1_MULT_AGG, TP2_MULT_AGG, TP3_MULT_AGG,       # V4 optimized TPs
+    BE_TRIGGER_MULT, BE_BUFFER_MULT,                   # Early breakeven
+    PROFIT_TRAIL_DISTANCE_MULT,                        # Post-TP1 trailing
+    STALL_BARS,                                        # Stall exit
+    MICRO_TP_MULT, MICRO_TP_PCT,                       # Micro-partial
+)
 
 # ---------------------------------------------------------------------------
 # Crash handler
@@ -78,10 +85,11 @@ TIMEFRAMES = list(TF_MAP.keys())
 MAGIC_NUMBER = 234567
 SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "aci_settings.json")
 
-# TP partial close splits (40% at TP1, 30% at TP2, close rest at TP3)
-TP1_CLOSE_PCT = 0.40
-TP2_CLOSE_PCT = 0.30   # of original
+# V4 partial close splits (1/3 at TP1, 1/3 at TP2, close rest at TP3)
+TP1_CLOSE_PCT = 0.33
+TP2_CLOSE_PCT = 0.33   # of original
 TP3_CLOSE_PCT = 1.00   # close remaining
+MICRO_CLOSE_PCT = MICRO_TP_PCT  # 15% micro-partial at 0.8x ATR
 
 # Margin safety — require at least this % free margin after trade
 MIN_MARGIN_LEVEL_PCT = 150   # 150% margin level = safe zone
@@ -489,6 +497,17 @@ class ScanEngine(QObject):
         self._last_signal_dir = {}   # {symbol: 1 or -1}
         self._last_bar_time = {}     # {symbol: datetime} — dedup bar
         self._entered_signals = {}   # {symbol: bar_time} — signals we've already traded
+        # V4 defaults (overridden by set_v4_params from UI)
+        self._v4 = {
+            "tp1_mult": TP1_MULT_AGG, "tp2_mult": TP2_MULT_AGG, "tp3_mult": TP3_MULT_AGG,
+            "be_trigger": BE_TRIGGER_MULT, "be_buffer": BE_BUFFER_MULT,
+            "micro_tp": MICRO_TP_MULT, "micro_pct": MICRO_TP_PCT,
+            "stall_bars": STALL_BARS, "trail_dist": PROFIT_TRAIL_DISTANCE_MULT,
+        }
+
+    def set_v4_params(self, params: dict):
+        """Update V4 profit capture parameters from UI settings."""
+        self._v4.update(params)
 
     # ── Trade helpers (ported from webhook_bridge.py) ──
 
@@ -708,15 +727,18 @@ class ScanEngine(QObject):
         if sl_val is None or atr_val is None:
             return
 
-        # TP levels based on original signal
+        # V4 optimized TP levels (read from UI settings)
+        _tp1m = self._v4["tp1_mult"]
+        _tp2m = self._v4["tp2_mult"]
+        _tp3m = self._v4["tp3_mult"]
         if direction == "BUY":
-            tp1 = entry_price + atr_val * TP1_MULT
-            tp2 = entry_price + atr_val * TP2_MULT
-            tp3 = entry_price + atr_val * TP3_MULT
+            tp1 = entry_price + atr_val * _tp1m
+            tp2 = entry_price + atr_val * _tp2m
+            tp3 = entry_price + atr_val * _tp3m
         else:
-            tp1 = entry_price - atr_val * TP1_MULT
-            tp2 = entry_price - atr_val * TP2_MULT
-            tp3 = entry_price - atr_val * TP3_MULT
+            tp1 = entry_price - atr_val * _tp1m
+            tp2 = entry_price - atr_val * _tp2m
+            tp3 = entry_price - atr_val * _tp3m
 
         # R:R check
         sl_dist = abs(entry_price - sl_val)
@@ -792,34 +814,57 @@ class ScanEngine(QObject):
 
 
 # ---------------------------------------------------------------------------
-# TP Manager — monitors positions, partial-closes at TP1/TP2/TP3
+# V4 TP Manager — Full 5-layer profit capture system
+# Layers: Micro-Partial | Early BE | Tighter TPs | Post-TP1 Trail | Stall Exit
 # ---------------------------------------------------------------------------
 class TPManager(QObject):
-    """Background TP manager: partial-close positions at TP1, TP2, TP3."""
+    """V4 Trade Manager: 5-layer profit capture matching backtested system."""
 
     log_message = Signal(str)
 
     def __init__(self):
         super().__init__()
         self._running = False
-        # Track which TPs have been hit per ticket: {ticket: {"tp1": bool, "tp2": bool, ...}}
-        self._tp_state = {}
-        # Store trade info: {ticket: {direction, entry, sl, tp1, tp2, tp3, original_lot}}
-        self._trade_info = {}
+        self._trade_info = {}   # {ticket: {direction, entry, sl, atr, tp1-3, original_lot}}
+        self._tp_state = {}     # {ticket: {tp1, tp2, tp3, micro_tp, be_activated, stall_be, ...}}
+        # V4 defaults (overridden by set_v4_params from UI)
+        self._v4 = {
+            "tp1_mult": TP1_MULT_AGG, "tp2_mult": TP2_MULT_AGG, "tp3_mult": TP3_MULT_AGG,
+            "be_trigger": BE_TRIGGER_MULT, "be_buffer": BE_BUFFER_MULT,
+            "micro_tp": MICRO_TP_MULT, "micro_pct": MICRO_TP_PCT,
+            "stall_bars": STALL_BARS, "trail_dist": PROFIT_TRAIL_DISTANCE_MULT,
+        }
 
-    def register_trade(self, ticket, direction, entry, sl, tp1, tp2, tp3, original_lot):
-        """Register a new trade for TP management."""
+    def set_v4_params(self, params: dict):
+        """Update V4 profit capture parameters from UI settings."""
+        self._v4.update(params)
+
+    def register_trade(self, ticket, direction, entry, sl, tp1, tp2, tp3, atr_val, original_lot):
+        """Register a new trade for V4 profit capture management."""
         self._trade_info[ticket] = {
             "direction": direction,
             "entry": entry,
             "sl": sl,
+            "atr": atr_val,
             "tp1": tp1,
             "tp2": tp2,
             "tp3": tp3,
             "original_lot": original_lot,
         }
-        self._tp_state[ticket] = {"tp1": False, "tp2": False, "tp3": False}
-        self.log_message.emit(f"  TP Manager: tracking ticket #{ticket} | TP1={tp1:.5f} TP2={tp2:.5f} TP3={tp3:.5f}")
+        self._tp_state[ticket] = {
+            "tp1": False, "tp2": False, "tp3": False,
+            "micro_tp": False,           # Micro-partial at micro_tp * ATR
+            "be_activated": False,       # Early BE at be_trigger * ATR
+            "stall_be": False,           # Stall exit after stall_bars checks
+            "profit_trail_sl": None,     # Post-TP1 trailing SL
+            "max_favorable": entry,      # Best price seen
+            "checks": 0,                 # ~bars since entry (each check = 2s, H4 = 14400s)
+        }
+        v = self._v4
+        self.log_message.emit(
+            f"  V4 Manager: #{ticket} | TP1={tp1:.5f} TP2={tp2:.5f} TP3={tp3:.5f} | "
+            f"BE@{v['be_trigger']}x Stall@{v['stall_bars']}bars Trail@{v['trail_dist']}x"
+        )
 
     def start(self):
         self._running = True
@@ -832,17 +877,17 @@ class TPManager(QObject):
     def _monitor_loop(self):
         while self._running:
             try:
-                self._check_tp_levels()
+                self._check_positions()
             except Exception as e:
-                self.log_message.emit(f"TP Manager error: {e}")
+                self.log_message.emit(f"V4 Manager error: {e}")
             _time.sleep(2)
 
-    def _check_tp_levels(self):
+    def _check_positions(self):
         positions = mt5.positions_get()
         if not positions:
             return
 
-        # Clean up closed trades from tracking
+        # Clean up closed trades
         open_tickets = {p.ticket for p in positions}
         closed = [t for t in self._trade_info if t not in open_tickets]
         for t in closed:
@@ -852,82 +897,177 @@ class TPManager(QObject):
         for pos in positions:
             if pos.magic != MAGIC_NUMBER:
                 continue
-
             ticket = pos.ticket
             if ticket not in self._trade_info:
-                # Trade not registered (might be from before app started) — skip
                 continue
 
             info = self._trade_info[ticket]
             state = self._tp_state[ticket]
             current = pos.price_current
             direction = info["direction"]
+            entry = info["entry"]
+            atr = info["atr"]
             original_lot = info["original_lot"]
-            vol_min = None
+            is_buy = direction == "BUY"
 
-            # Check TP1
+            sym_info = mt5.symbol_info(pos.symbol)
+            if not sym_info:
+                continue
+
+            state["checks"] += 1
+
+            # Track max favorable price
+            if is_buy:
+                if current > state["max_favorable"]:
+                    state["max_favorable"] = current
+                cur_profit_dist = current - entry
+            else:
+                if current < state["max_favorable"]:
+                    state["max_favorable"] = current
+                cur_profit_dist = entry - current
+
+            max_profit_dist = abs(state["max_favorable"] - entry)
+
+            # Local V4 params from UI settings
+            _v = self._v4
+            _micro_tp_mult = _v["micro_tp"]
+            _micro_pct = _v["micro_pct"]
+            _be_trigger = _v["be_trigger"]
+            _be_buffer = _v["be_buffer"]
+            _stall_bars = _v["stall_bars"]
+            _trail_dist_mult = _v["trail_dist"]
+
+            # ── Layer 1: Micro-Partial at micro_tp * ATR ──
+            if not state["micro_tp"] and not state["tp1"]:
+                micro_level = entry + (_micro_tp_mult * atr if is_buy else -_micro_tp_mult * atr)
+                micro_hit = (is_buy and current >= micro_level) or (not is_buy and current <= micro_level)
+                if micro_hit:
+                    close_lot = round(original_lot * _micro_pct, 2)
+                    vol_step = sym_info.volume_step
+                    vol_min = sym_info.volume_min
+                    close_lot = max(vol_min, round(close_lot / vol_step) * vol_step)
+                    close_lot = min(close_lot, pos.volume)
+                    if close_lot >= vol_min:
+                        ok = self._partial_close(pos, close_lot, sym_info)
+                        if ok:
+                            state["micro_tp"] = True
+                            self.log_message.emit(
+                                f"  MICRO-TP: {pos.symbol} closed {close_lot:.2f}L "
+                                f"@ {current:.5f} ({_micro_tp_mult}x ATR)")
+
+            # ── Layer 2: Early BE at be_trigger * ATR ──
+            if not state["be_activated"]:
+                if max_profit_dist >= _be_trigger * atr:
+                    be_level = entry + (_be_buffer * atr if is_buy else -_be_buffer * atr)
+                    # Only move SL if it improves (tighter)
+                    should_move = (is_buy and be_level > pos.sl) or (not is_buy and be_level < pos.sl)
+                    if should_move:
+                        ok = self._move_sl(pos, be_level, sym_info)
+                        if ok:
+                            state["be_activated"] = True
+                            self.log_message.emit(
+                                f"  EARLY BE: {pos.symbol} SL -> {be_level:.5f} "
+                                f"(entry+{_be_buffer}x ATR)")
+
+            # ── Layer 3: Stall Exit — move to BE after stall_bars H4 bars w/o TP1 ──
+            if not state["tp1"] and not state["stall_be"]:
+                # Approximate bars: each check is 2s, H4 bar = 14400s
+                approx_bars = state["checks"] * 2 / 14400
+                if approx_bars >= _stall_bars:
+                    be_level = entry + (_be_buffer * atr if is_buy else -_be_buffer * atr)
+                    should_move = (is_buy and be_level > pos.sl) or (not is_buy and be_level < pos.sl)
+                    if should_move:
+                        ok = self._move_sl(pos, be_level, sym_info)
+                        if ok:
+                            state["stall_be"] = True
+                            state["be_activated"] = True
+                            self.log_message.emit(
+                                f"  STALL EXIT: {pos.symbol} SL -> BE after ~{approx_bars:.1f} bars w/o TP1")
+
+            # ── Layer 4: TP1 Hit — partial close + activate profit trail ──
             if not state["tp1"]:
-                hit = (direction == "BUY" and current >= info["tp1"]) or \
-                      (direction == "SELL" and current <= info["tp1"])
+                hit = (is_buy and current >= info["tp1"]) or (not is_buy and current <= info["tp1"])
                 if hit:
                     close_lot = round(original_lot * TP1_CLOSE_PCT, 2)
-                    sym_info = mt5.symbol_info(pos.symbol)
-                    if sym_info:
-                        vol_min = sym_info.volume_min
-                        vol_step = sym_info.volume_step
-                        close_lot = max(vol_min, round(close_lot / vol_step) * vol_step)
-                        close_lot = min(close_lot, pos.volume)  # can't close more than open
-                        if close_lot >= vol_min:
-                            ok = self._partial_close(pos, close_lot, sym_info)
-                            if ok:
-                                state["tp1"] = True
-                                # Move SL to breakeven
-                                self._move_sl_to_be(pos, info["entry"], sym_info)
-                                self.log_message.emit(
-                                    f"  TP1 HIT: {pos.symbol} closed {close_lot:.2f}L "
-                                    f"@ {current:.5f} | SL -> BE")
-
-            # Check TP2
-            elif not state["tp2"]:
-                hit = (direction == "BUY" and current >= info["tp2"]) or \
-                      (direction == "SELL" and current <= info["tp2"])
-                if hit:
-                    # Get refreshed position volume
+                    vol_step = sym_info.volume_step
+                    vol_min = sym_info.volume_min
+                    close_lot = max(vol_min, round(close_lot / vol_step) * vol_step)
+                    # Refresh volume (micro-partial may have reduced it)
                     refreshed = mt5.positions_get(ticket=ticket)
-                    if refreshed and len(refreshed) > 0:
-                        cur_vol = refreshed[0].volume
-                    else:
-                        continue  # position might be closed
-                    close_lot = round(original_lot * TP2_CLOSE_PCT, 2)
-                    sym_info = mt5.symbol_info(pos.symbol)
-                    if sym_info:
-                        vol_min = sym_info.volume_min
-                        vol_step = sym_info.volume_step
-                        close_lot = max(vol_min, round(close_lot / vol_step) * vol_step)
-                        close_lot = min(close_lot, cur_vol)
-                        if close_lot >= vol_min:
-                            ok = self._partial_close(pos, close_lot, sym_info)
-                            if ok:
-                                state["tp2"] = True
-                                # Trail SL to TP1 level
-                                self._move_sl(pos, info["tp1"], sym_info)
-                                self.log_message.emit(
-                                    f"  TP2 HIT: {pos.symbol} closed {close_lot:.2f}L "
-                                    f"@ {current:.5f} | SL -> TP1 ({info['tp1']:.5f})")
+                    cur_vol = refreshed[0].volume if refreshed and len(refreshed) > 0 else pos.volume
+                    close_lot = min(close_lot, cur_vol)
+                    if close_lot >= vol_min:
+                        ok = self._partial_close(pos, close_lot, sym_info)
+                        if ok:
+                            state["tp1"] = True
+                            # Move SL to BE if not already
+                            if not state["be_activated"]:
+                                be_level = entry + (_be_buffer * atr if is_buy else -_be_buffer * atr)
+                                self._move_sl(pos, be_level, sym_info)
+                                state["be_activated"] = True
+                            self.log_message.emit(
+                                f"  TP1 HIT: {pos.symbol} closed {close_lot:.2f}L "
+                                f"@ {current:.5f} | Trail activated")
 
-            # Check TP3
-            elif not state["tp3"]:
-                hit = (direction == "BUY" and current >= info["tp3"]) or \
-                      (direction == "SELL" and current <= info["tp3"])
+            # ── Layer 5: Post-TP1 Profit Trail ──
+            if state["tp1"] and not state["tp3"]:
+                trail_dist = _trail_dist_mult * atr
+                if is_buy:
+                    new_trail = state["max_favorable"] - trail_dist
+                    if new_trail > entry and (state["profit_trail_sl"] is None or new_trail > state["profit_trail_sl"]):
+                        state["profit_trail_sl"] = new_trail
+                        # Move SL to trail level
+                        if new_trail > pos.sl:
+                            ok = self._move_sl(pos, new_trail, sym_info)
+                            if ok:
+                                self.log_message.emit(
+                                    f"  TRAIL: {pos.symbol} SL -> {new_trail:.5f} "
+                                    f"(peak={state['max_favorable']:.5f} - {_trail_dist_mult}x ATR)")
+                else:
+                    new_trail = state["max_favorable"] + trail_dist
+                    if new_trail < entry and (state["profit_trail_sl"] is None or new_trail < state["profit_trail_sl"]):
+                        state["profit_trail_sl"] = new_trail
+                        if new_trail < pos.sl:
+                            ok = self._move_sl(pos, new_trail, sym_info)
+                            if ok:
+                                self.log_message.emit(
+                                    f"  TRAIL: {pos.symbol} SL -> {new_trail:.5f} "
+                                    f"(peak={state['max_favorable']:.5f} + {_trail_dist_mult}x ATR)")
+
+            # ── TP2: partial close + tighten trail ──
+            if state["tp1"] and not state["tp2"]:
+                hit = (is_buy and current >= info["tp2"]) or (not is_buy and current <= info["tp2"])
                 if hit:
-                    # Close remaining position entirely
                     refreshed = mt5.positions_get(ticket=ticket)
                     if refreshed and len(refreshed) > 0:
                         cur_vol = refreshed[0].volume
                     else:
                         continue
-                    sym_info = mt5.symbol_info(pos.symbol)
-                    if sym_info and cur_vol > 0:
+                    close_lot = round(original_lot * TP2_CLOSE_PCT, 2)
+                    vol_step = sym_info.volume_step
+                    vol_min = sym_info.volume_min
+                    close_lot = max(vol_min, round(close_lot / vol_step) * vol_step)
+                    close_lot = min(close_lot, cur_vol)
+                    if close_lot >= vol_min:
+                        ok = self._partial_close(pos, close_lot, sym_info)
+                        if ok:
+                            state["tp2"] = True
+                            # Move SL to TP1 level
+                            self._move_sl(pos, info["tp1"], sym_info)
+                            self.log_message.emit(
+                                f"  TP2 HIT: {pos.symbol} closed {close_lot:.2f}L "
+                                f"@ {current:.5f} | SL -> TP1")
+
+            # ── TP3: close everything ──
+            if state["tp2"] and not state["tp3"]:
+                hit = (is_buy and current >= info["tp3"]) or (not is_buy and current <= info["tp3"])
+                if hit:
+                    refreshed = mt5.positions_get(ticket=ticket)
+                    if refreshed and len(refreshed) > 0:
+                        cur_vol = refreshed[0].volume
+                    else:
+                        continue
+                    if cur_vol > 0:
                         ok = self._partial_close(pos, cur_vol, sym_info)
                         if ok:
                             state["tp3"] = True
@@ -1001,9 +1141,9 @@ class ACiApp(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("ACi")
+        self.setWindowTitle("ACi  —  V4 ZeroPoint Pro  |  97.5% WR")
         self.setMinimumSize(900, 700)
-        self.resize(1100, 800)
+        self.resize(1200, 850)
 
         self._dark_mode = True
         self._scanner = None
@@ -1023,6 +1163,8 @@ class ACiApp(QMainWindow):
 
         self._build_ui()
         self._load_settings()
+        # Push V4 params to TP manager after UI is built + settings loaded
+        self._tp_manager.set_v4_params(self._get_v4_params())
         self.setStyleSheet(DARK_STYLE)
 
         # MT5 check on startup
@@ -1121,40 +1263,159 @@ class ACiApp(QMainWindow):
 
         main_layout.addLayout(btn_row)
 
-        # --- Settings ---
-        settings_group = QGroupBox("Settings")
-        settings_layout = QHBoxLayout(settings_group)
+        # --- Trade Execution Settings (3 rows in one group) ---
+        settings_group = QGroupBox("Trade Execution  —  V4 Profit Capture")
+        settings_main = QVBoxLayout(settings_group)
+        settings_main.setSpacing(6)
 
-        settings_layout.addWidget(QLabel("Risk %:"))
-        self.inp_risk = QLineEdit("8")
+        # ── Row 1: Core execution params ──
+        row1 = QHBoxLayout()
+        row1.setSpacing(12)
+
+        row1.addWidget(QLabel("Risk %:"))
+        self.inp_risk = QLineEdit("30")
         self.inp_risk.setFixedWidth(40)
-        settings_layout.addWidget(self.inp_risk)
+        self.inp_risk.setToolTip("Risk per trade (30% = half-Kelly for 97.5% WR)")
+        row1.addWidget(self.inp_risk)
 
-        settings_layout.addWidget(QLabel("Lots:"))
+        row1.addWidget(QLabel("Lots:"))
         self.inp_lots = QLineEdit("0.40")
         self.inp_lots.setFixedWidth(50)
-        settings_layout.addWidget(self.inp_lots)
+        self.inp_lots.setToolTip("Default lot size (overridden by risk-based sizing)")
+        row1.addWidget(self.inp_lots)
 
-        settings_layout.addWidget(QLabel("Max:"))
+        row1.addWidget(QLabel("Max:"))
         self.inp_max_trades = QLineEdit("5")
         self.inp_max_trades.setFixedWidth(30)
-        settings_layout.addWidget(self.inp_max_trades)
+        self.inp_max_trades.setToolTip("Max concurrent trades across all pairs")
+        row1.addWidget(self.inp_max_trades)
 
-        settings_layout.addWidget(QLabel("Poll (sec):"))
+        row1.addWidget(QLabel("Poll (sec):"))
         self.inp_poll = QLineEdit("30")
         self.inp_poll.setFixedWidth(40)
-        settings_layout.addWidget(self.inp_poll)
+        row1.addWidget(self.inp_poll)
 
-        settings_layout.addWidget(QLabel("Timeframe:"))
+        row1.addWidget(QLabel("Timeframe:"))
         self.combo_tf = QComboBox()
         self.combo_tf.setFixedWidth(70)
         for tf in TIMEFRAMES:
             self.combo_tf.addItem(tf, tf)
         self.combo_tf.setCurrentIndex(5)  # H4 default
         self.combo_tf.currentIndexChanged.connect(self._on_tf_changed)
-        settings_layout.addWidget(self.combo_tf)
+        row1.addWidget(self.combo_tf)
 
-        settings_layout.addStretch()
+        row1.addStretch()
+        settings_main.addLayout(row1)
+
+        # ── Thin separator ──
+        sep_h = QFrame()
+        sep_h.setFrameShape(QFrame.Shape.HLine)
+        sep_h.setStyleSheet("color: #3A352B;")
+        settings_main.addWidget(sep_h)
+
+        # ── Row 2: V4 TPs + Breakeven ──
+        _tp = "color: #4ADE80; font-weight: bold; font-size: 12px;"
+        _be = "color: #FBBF24; font-weight: bold; font-size: 12px;"
+        _mi = "color: #38BDF8; font-weight: bold; font-size: 12px;"
+        _tr = "color: #A78BFA; font-weight: bold; font-size: 12px;"
+        _u = "font-size: 11px;"
+
+        row2 = QHBoxLayout()
+        row2.setSpacing(12)
+
+        lbl = QLabel("TP1:"); lbl.setStyleSheet(_tp); row2.addWidget(lbl)
+        self.inp_tp1 = QLineEdit(str(TP1_MULT_AGG))
+        self.inp_tp1.setFixedWidth(40)
+        self.inp_tp1.setToolTip("TP1 distance in ATR multiples (V4: 0.8)")
+        row2.addWidget(self.inp_tp1)
+        lbl = QLabel("x"); lbl.setStyleSheet(_u); row2.addWidget(lbl)
+
+        lbl = QLabel("TP2:"); lbl.setStyleSheet(_tp); row2.addWidget(lbl)
+        self.inp_tp2 = QLineEdit(str(TP2_MULT_AGG))
+        self.inp_tp2.setFixedWidth(40)
+        self.inp_tp2.setToolTip("TP2 distance in ATR multiples (V4: 2.0)")
+        row2.addWidget(self.inp_tp2)
+        lbl = QLabel("x"); lbl.setStyleSheet(_u); row2.addWidget(lbl)
+
+        lbl = QLabel("TP3:"); lbl.setStyleSheet(_tp); row2.addWidget(lbl)
+        self.inp_tp3 = QLineEdit(str(TP3_MULT_AGG))
+        self.inp_tp3.setFixedWidth(40)
+        self.inp_tp3.setToolTip("TP3 distance in ATR multiples (V4: 5.0)")
+        row2.addWidget(self.inp_tp3)
+        lbl = QLabel("x ATR"); lbl.setStyleSheet(_u); row2.addWidget(lbl)
+
+        sep_v = QFrame(); sep_v.setFrameShape(QFrame.Shape.VLine)
+        sep_v.setStyleSheet("color: #3A352B;"); row2.addWidget(sep_v)
+
+        lbl = QLabel("BE:"); lbl.setStyleSheet(_be); row2.addWidget(lbl)
+        self.inp_be_trigger = QLineEdit(str(BE_TRIGGER_MULT))
+        self.inp_be_trigger.setFixedWidth(36)
+        self.inp_be_trigger.setToolTip("Move SL to breakeven at this ATR multiple (0.5)")
+        row2.addWidget(self.inp_be_trigger)
+        lbl = QLabel("x"); lbl.setStyleSheet(_u); row2.addWidget(lbl)
+
+        lbl = QLabel("Buf:"); lbl.setStyleSheet(_be); row2.addWidget(lbl)
+        self.inp_be_buffer = QLineEdit(str(BE_BUFFER_MULT))
+        self.inp_be_buffer.setFixedWidth(36)
+        self.inp_be_buffer.setToolTip("BE SL set to entry + buffer (0.15 = slight profit)")
+        row2.addWidget(self.inp_be_buffer)
+        lbl = QLabel("x ATR"); lbl.setStyleSheet(_u); row2.addWidget(lbl)
+
+        row2.addStretch()
+        settings_main.addLayout(row2)
+
+        # ── Row 3: Micro-partial + Stall + Trail + live status ──
+        row3 = QHBoxLayout()
+        row3.setSpacing(12)
+
+        lbl = QLabel("Micro:"); lbl.setStyleSheet(_mi); row3.addWidget(lbl)
+        self.inp_micro_tp = QLineEdit(str(MICRO_TP_MULT))
+        self.inp_micro_tp.setFixedWidth(36)
+        self.inp_micro_tp.setToolTip("Take micro-partial at this ATR distance (0.8x)")
+        row3.addWidget(self.inp_micro_tp)
+        lbl = QLabel("x ATR"); lbl.setStyleSheet(_u); row3.addWidget(lbl)
+
+        lbl = QLabel("Take:"); lbl.setStyleSheet(_mi); row3.addWidget(lbl)
+        self.inp_micro_pct = QLineEdit(str(int(MICRO_TP_PCT * 100)))
+        self.inp_micro_pct.setFixedWidth(30)
+        self.inp_micro_pct.setToolTip("Percent of lot to close at micro-TP (15%)")
+        row3.addWidget(self.inp_micro_pct)
+        lbl = QLabel("%"); lbl.setStyleSheet(_u); row3.addWidget(lbl)
+
+        sep_v2 = QFrame(); sep_v2.setFrameShape(QFrame.Shape.VLine)
+        sep_v2.setStyleSheet("color: #3A352B;"); row3.addWidget(sep_v2)
+
+        lbl = QLabel("Stall:"); lbl.setStyleSheet(_tr); row3.addWidget(lbl)
+        self.inp_stall = QLineEdit(str(STALL_BARS))
+        self.inp_stall.setFixedWidth(30)
+        self.inp_stall.setToolTip("Move SL to BE after this many H4 bars without TP1 (6)")
+        row3.addWidget(self.inp_stall)
+        lbl = QLabel("bars"); lbl.setStyleSheet(_u); row3.addWidget(lbl)
+
+        lbl = QLabel("Trail:"); lbl.setStyleSheet(_tr); row3.addWidget(lbl)
+        self.inp_trail = QLineEdit(str(PROFIT_TRAIL_DISTANCE_MULT))
+        self.inp_trail.setFixedWidth(36)
+        self.inp_trail.setToolTip("Post-TP1 trailing SL distance in ATR multiples (0.8)")
+        row3.addWidget(self.inp_trail)
+        lbl = QLabel("x ATR"); lbl.setStyleSheet(_u); row3.addWidget(lbl)
+
+        sep_v3 = QFrame(); sep_v3.setFrameShape(QFrame.Shape.VLine)
+        sep_v3.setStyleSheet("color: #3A352B;"); row3.addWidget(sep_v3)
+
+        self.lbl_v4_active = QLabel("V4: Waiting...")
+        self.lbl_v4_active.setStyleSheet("font-weight: bold; font-size: 12px; color: #6B6355;")
+        row3.addWidget(self.lbl_v4_active)
+
+        row3.addStretch()
+        settings_main.addLayout(row3)
+
+        # Live-update V4 params when any field changes
+        for inp in (self.inp_tp1, self.inp_tp2, self.inp_tp3,
+                    self.inp_be_trigger, self.inp_be_buffer,
+                    self.inp_micro_tp, self.inp_micro_pct,
+                    self.inp_stall, self.inp_trail):
+            inp.editingFinished.connect(self._push_v4_params)
+
         main_layout.addWidget(settings_group)
 
         # --- Pairs ---
@@ -1237,7 +1498,7 @@ class ACiApp(QMainWindow):
 
             symbols = [s for s, cb in self.pair_checks.items() if cb.isChecked()]
             poll = int(self.inp_poll.text() or "30")
-            risk = float(self.inp_risk.text() or "8") / 100
+            risk = float(self.inp_risk.text() or "30") / 100
             lots = float(self.inp_lots.text() or "0.40")
             max_trades = int(self.inp_max_trades.text() or "5")
 
@@ -1246,6 +1507,7 @@ class ACiApp(QMainWindow):
             self._scanner.log_message.connect(self._on_scanner_log)
             self._scanner.signal_detected.connect(self._on_signal)
             self._scanner.scan_complete.connect(self._on_scan_data)
+            self._push_v4_params()
             self._scanner.start_scanning(symbols, tf_key, poll, risk, lots, max_trades)
 
     # ── MT5 check ──
@@ -1270,6 +1532,38 @@ class ACiApp(QMainWindow):
             self.lbl_mt5.setText("MT5: ERROR")
             return False
 
+    # ── V4 Params ──
+
+    def _get_v4_params(self):
+        """Read V4 profit capture parameters from UI input fields."""
+        try:
+            return {
+                "tp1_mult": float(self.inp_tp1.text() or TP1_MULT_AGG),
+                "tp2_mult": float(self.inp_tp2.text() or TP2_MULT_AGG),
+                "tp3_mult": float(self.inp_tp3.text() or TP3_MULT_AGG),
+                "be_trigger": float(self.inp_be_trigger.text() or BE_TRIGGER_MULT),
+                "be_buffer": float(self.inp_be_buffer.text() or BE_BUFFER_MULT),
+                "micro_tp": float(self.inp_micro_tp.text() or MICRO_TP_MULT),
+                "micro_pct": float(self.inp_micro_pct.text() or str(MICRO_TP_PCT * 100)) / 100,
+                "stall_bars": int(self.inp_stall.text() or STALL_BARS),
+                "trail_dist": float(self.inp_trail.text() or PROFIT_TRAIL_DISTANCE_MULT),
+            }
+        except (ValueError, AttributeError):
+            # Fallback to module defaults if UI parse fails
+            return {
+                "tp1_mult": TP1_MULT_AGG, "tp2_mult": TP2_MULT_AGG, "tp3_mult": TP3_MULT_AGG,
+                "be_trigger": BE_TRIGGER_MULT, "be_buffer": BE_BUFFER_MULT,
+                "micro_tp": MICRO_TP_MULT, "micro_pct": MICRO_TP_PCT,
+                "stall_bars": STALL_BARS, "trail_dist": PROFIT_TRAIL_DISTANCE_MULT,
+            }
+
+    def _push_v4_params(self):
+        """Push current V4 params from UI to scanner and TPManager."""
+        v4 = self._get_v4_params()
+        if self._scanner:
+            self._scanner.set_v4_params(v4)
+        self._tp_manager.set_v4_params(v4)
+
     # ── Start/Stop ──
 
     def _on_start(self):
@@ -1287,7 +1581,7 @@ class ACiApp(QMainWindow):
 
         tf_key = self.combo_tf.currentData()
         poll = int(self.inp_poll.text() or "30")
-        risk = float(self.inp_risk.text() or "8") / 100
+        risk = float(self.inp_risk.text() or "30") / 100
         lots = float(self.inp_lots.text() or "0.40")
         max_trades = int(self.inp_max_trades.text() or "5")
 
@@ -1296,6 +1590,8 @@ class ACiApp(QMainWindow):
         self._scanner.log_message.connect(self._on_scanner_log)
         self._scanner.signal_detected.connect(self._on_signal)
         self._scanner.scan_complete.connect(self._on_scan_data)
+        # Push V4 params from UI to scanner + TP manager
+        self._push_v4_params()
         self._scanner.start_scanning(symbols, tf_key, poll, risk, lots, max_trades)
 
         self._running = True
@@ -1341,16 +1637,21 @@ class ACiApp(QMainWindow):
         self._log(msg)
 
     def _on_signal(self, symbol, direction, entry, sl, tp1, tp2, tp3, atr):
-        self._log(f"*** SIGNAL: {direction} {symbol} @ {entry:.5f} "
-                  f"SL={sl:.5f} TP1={tp1:.5f} TP2={tp2:.5f} TP3={tp3:.5f} ***")
+        sl_dist = abs(entry - sl)
+        rr = abs(tp1 - entry) / sl_dist if sl_dist > 0 else 0
+        v4 = self._get_v4_params()
+        be_price = entry + (v4["be_trigger"] * atr if direction == "BUY" else -v4["be_trigger"] * atr)
+        self._log(f"*** V4 SIGNAL: {direction} {symbol} @ {entry:.5f} | "
+                  f"SL={sl:.5f} TP1={tp1:.5f} TP2={tp2:.5f} TP3={tp3:.5f} | "
+                  f"R:R={rr:.2f} BE@{be_price:.5f} ATR={atr:.5f} ***")
 
-        # Register with TP Manager if trading is enabled
-        # Find the matching open position ticket
+        # Register with V4 TP Manager if trading is enabled
+        # Find the matching open position ticket (delay 3s for MT5 to register)
         if self._trading_enabled:
             QTimer.singleShot(3000, lambda: self._register_trade_for_tp(
-                symbol, direction, entry, sl, tp1, tp2, tp3))
+                symbol, direction, entry, sl, tp1, tp2, tp3, atr))
 
-        # Draw SL/TP levels on chart
+        # Draw V4 levels on chart (Entry, SL, BE trigger, Micro-TP, TP1, TP2, TP3)
         if symbol in self.chart_objects:
             chart = self.chart_objects[symbol]
             try:
@@ -1361,18 +1662,30 @@ class ACiApp(QMainWindow):
                     except Exception:
                         pass
 
+                # Calculate V4 levels from UI settings
+                sign = 1 if direction == "BUY" else -1
+                micro_level = entry + sign * v4["micro_tp"] * atr
+                be_level = entry + sign * v4["be_trigger"] * atr
+
                 lines = []
-                lines.append(chart.horizontal_line(entry, color="#FFFFFF", width=1, style="dashed", text=f"Entry {entry:.5f}"))
-                lines.append(chart.horizontal_line(sl, color="#F87171", width=2, style="solid", text=f"SL {sl:.5f}"))
-                lines.append(chart.horizontal_line(tp1, color="#4ADE80", width=1, style="dashed", text=f"TP1 {tp1:.5f}"))
-                lines.append(chart.horizontal_line(tp2, color="#4ADE80", width=1, style="dashed", text=f"TP2 {tp2:.5f}"))
-                lines.append(chart.horizontal_line(tp3, color="#4ADE80", width=1, style="dashed", text=f"TP3 {tp3:.5f}"))
+                lines.append(chart.horizontal_line(entry, color="#FFFFFF", width=1, style="dashed",
+                             text=f"ENTRY {entry:.5f}"))
+                lines.append(chart.horizontal_line(sl, color="#F87171", width=2, style="solid",
+                             text=f"SL {sl:.5f}"))
+                lines.append(chart.horizontal_line(be_level, color="#FBBF24", width=1, style="dashed",
+                             text=f"BE Trigger {be_level:.5f}"))
+                lines.append(chart.horizontal_line(tp1, color="#4ADE80", width=1, style="dashed",
+                             text=f"TP1 {tp1:.5f} ({v4['tp1_mult']}x ATR)"))
+                lines.append(chart.horizontal_line(tp2, color="#38BDF8", width=1, style="dashed",
+                             text=f"TP2 {tp2:.5f} ({v4['tp2_mult']}x ATR)"))
+                lines.append(chart.horizontal_line(tp3, color="#A78BFA", width=1, style="dashed",
+                             text=f"TP3 {tp3:.5f} ({v4['tp3_mult']}x ATR)"))
                 self.chart_sl_lines[symbol] = lines
             except Exception as e:
                 self._log(f"[{symbol}] Level draw error: {e}")
 
-    def _register_trade_for_tp(self, symbol, direction, entry, sl, tp1, tp2, tp3):
-        """Find the just-placed trade ticket and register it with TP manager."""
+    def _register_trade_for_tp(self, symbol, direction, entry, sl, tp1, tp2, tp3, atr_val):
+        """Find the just-placed trade ticket and register it with V4 TP manager."""
         try:
             positions = mt5.positions_get()
             if not positions:
@@ -1384,7 +1697,7 @@ class ACiApp(QMainWindow):
                     # Check it's not already tracked
                     if pos.ticket not in self._tp_manager._trade_info:
                         self._tp_manager.register_trade(
-                            pos.ticket, direction, entry, sl, tp1, tp2, tp3, pos.volume)
+                            pos.ticket, direction, entry, sl, tp1, tp2, tp3, atr_val, pos.volume)
                         return
         except Exception as e:
             self._log(f"TP registration error: {e}")
@@ -1399,7 +1712,7 @@ class ACiApp(QMainWindow):
             return
 
         dlg = QDialog(self)
-        dlg.setWindowTitle("ACi — Positions & History")
+        dlg.setWindowTitle("ACi V4 — Positions & Trade Management")
         dlg.resize(900, 600)
         dlg.setStyleSheet(DARK_STYLE if self._dark_mode else CLAUDE_STYLE)
         layout = QVBoxLayout(dlg)
@@ -1416,10 +1729,11 @@ class ACiApp(QMainWindow):
         layout.addLayout(acct_row)
 
         # --- Open positions table ---
-        layout.addWidget(QLabel("Open Positions"))
-        self._dlg_tbl_open = QTableWidget(0, 9)
+        layout.addWidget(QLabel("Open Positions  —  V4 Profit Capture"))
+        self._dlg_tbl_open = QTableWidget(0, 11)
         self._dlg_tbl_open.setHorizontalHeaderLabels(
-            ["Symbol", "Dir", "Lots", "Entry", "Current", "P/L", "SL", "TP", "TP Status"])
+            ["Symbol", "Dir", "Lots", "Entry", "Current", "P/L", "SL", "TP",
+             "V4 Layers", "Trail SL", "Peak"])
         self._dlg_tbl_open.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self._dlg_tbl_open.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._dlg_tbl_open.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -1488,18 +1802,45 @@ class ACiApp(QMainWindow):
                 self._dlg_tbl_open.setItem(row, 6, QTableWidgetItem(f"{pos.sl:.5f}"))
                 self._dlg_tbl_open.setItem(row, 7, QTableWidgetItem(f"{pos.tp:.5f}"))
 
-                # TP status
+                # V4 Layers status
                 tp_state = self._tp_manager._tp_state.get(pos.ticket, {})
                 if tp_state:
-                    tp1_ok = "1" if tp_state.get("tp1") else "-"
-                    tp2_ok = "2" if tp_state.get("tp2") else "-"
-                    tp3_ok = "3" if tp_state.get("tp3") else "-"
-                    tp_text = f"[{tp1_ok}|{tp2_ok}|{tp3_ok}]"
+                    layers = []
+                    if tp_state.get("micro_tp"):
+                        layers.append("uTP")
+                    if tp_state.get("be_activated"):
+                        layers.append("BE")
+                    if tp_state.get("stall_be"):
+                        layers.append("STALL")
+                    if tp_state.get("tp1"):
+                        layers.append("TP1")
+                    if tp_state.get("tp2"):
+                        layers.append("TP2")
+                    if tp_state.get("tp3"):
+                        layers.append("TP3")
+                    if tp_state.get("profit_trail_sl") is not None:
+                        layers.append("TRAIL")
+                    layer_text = " ".join(layers) if layers else "---"
                 else:
-                    tp_text = "—"
-                tp_item = QTableWidgetItem(tp_text)
-                tp_item.setForeground(QColor("#4ADE80") if tp_state.get("tp1") else QColor("#B5AFA5"))
-                self._dlg_tbl_open.setItem(row, 8, tp_item)
+                    layer_text = "untracked"
+                layer_item = QTableWidgetItem(layer_text)
+                if "TP1" in layer_text:
+                    layer_item.setForeground(QColor("#4ADE80"))
+                elif "BE" in layer_text:
+                    layer_item.setForeground(QColor("#FBBF24"))
+                else:
+                    layer_item.setForeground(QColor("#B5AFA5"))
+                self._dlg_tbl_open.setItem(row, 8, layer_item)
+
+                # Trail SL
+                trail_sl = tp_state.get("profit_trail_sl") if tp_state else None
+                trail_text = f"{trail_sl:.5f}" if trail_sl is not None else "---"
+                self._dlg_tbl_open.setItem(row, 9, QTableWidgetItem(trail_text))
+
+                # Peak (max favorable price)
+                peak = tp_state.get("max_favorable") if tp_state else None
+                peak_text = f"{peak:.5f}" if peak is not None else "---"
+                self._dlg_tbl_open.setItem(row, 10, QTableWidgetItem(peak_text))
 
             # --- Trade history (today's deals) ---
             from datetime import datetime, timedelta
@@ -1677,6 +2018,25 @@ class ACiApp(QMainWindow):
                 self.lbl_growth.setText(f"Growth: {sign}{growth:.2f}%")
                 self.lbl_growth.setStyleSheet(f"font-weight: bold; font-size: 13px; color: {g_color};")
 
+            # Update V4 manager active trade count
+            managed = len(self._tp_manager._trade_info)
+            be_count = sum(1 for s in self._tp_manager._tp_state.values() if s.get("be_activated"))
+            tp1_count = sum(1 for s in self._tp_manager._tp_state.values() if s.get("tp1"))
+            trail_count = sum(1 for s in self._tp_manager._tp_state.values() if s.get("profit_trail_sl") is not None)
+            if managed > 0:
+                parts = [f"{managed} managed"]
+                if be_count:
+                    parts.append(f"{be_count} BE")
+                if tp1_count:
+                    parts.append(f"{tp1_count} TP1")
+                if trail_count:
+                    parts.append(f"{trail_count} trailing")
+                self.lbl_v4_active.setText("V4: " + " | ".join(parts))
+                self.lbl_v4_active.setStyleSheet("font-weight: bold; font-size: 12px; color: #4ADE80;")
+            else:
+                self.lbl_v4_active.setText("V4: Waiting for trades...")
+                self.lbl_v4_active.setStyleSheet("font-weight: bold; font-size: 12px; color: #6B6355;")
+
         except Exception:
             pass
 
@@ -1754,6 +2114,16 @@ class ACiApp(QMainWindow):
             "poll_sec": self.inp_poll.text(),
             "timeframe": self.combo_tf.currentData(),
             "pairs": {s: cb.isChecked() for s, cb in self.pair_checks.items()},
+            # V4 Profit Capture parameters
+            "v4_tp1": self.inp_tp1.text(),
+            "v4_tp2": self.inp_tp2.text(),
+            "v4_tp3": self.inp_tp3.text(),
+            "v4_be_trigger": self.inp_be_trigger.text(),
+            "v4_be_buffer": self.inp_be_buffer.text(),
+            "v4_micro_tp": self.inp_micro_tp.text(),
+            "v4_micro_pct": self.inp_micro_pct.text(),
+            "v4_stall": self.inp_stall.text(),
+            "v4_trail": self.inp_trail.text(),
         }
         try:
             with open(SETTINGS_PATH, "w") as f:
@@ -1765,7 +2135,7 @@ class ACiApp(QMainWindow):
         try:
             with open(SETTINGS_PATH, "r") as f:
                 s = json.load(f)
-            self.inp_risk.setText(s.get("risk", "8"))
+            self.inp_risk.setText(s.get("risk", "30"))
             self.inp_lots.setText(s.get("lots", "0.40"))
             self.inp_max_trades.setText(s.get("max_trades", "5"))
             self.inp_poll.setText(s.get("poll_sec", "30"))
@@ -1779,6 +2149,25 @@ class ACiApp(QMainWindow):
                     self.pair_checks[sym].setChecked(active)
             if not s.get("dark_mode", True):
                 self._toggle_theme()
+            # V4 Profit Capture parameters
+            if "v4_tp1" in s:
+                self.inp_tp1.setText(s["v4_tp1"])
+            if "v4_tp2" in s:
+                self.inp_tp2.setText(s["v4_tp2"])
+            if "v4_tp3" in s:
+                self.inp_tp3.setText(s["v4_tp3"])
+            if "v4_be_trigger" in s:
+                self.inp_be_trigger.setText(s["v4_be_trigger"])
+            if "v4_be_buffer" in s:
+                self.inp_be_buffer.setText(s["v4_be_buffer"])
+            if "v4_micro_tp" in s:
+                self.inp_micro_tp.setText(s["v4_micro_tp"])
+            if "v4_micro_pct" in s:
+                self.inp_micro_pct.setText(s["v4_micro_pct"])
+            if "v4_stall" in s:
+                self.inp_stall.setText(s["v4_stall"])
+            if "v4_trail" in s:
+                self.inp_trail.setText(s["v4_trail"])
         except FileNotFoundError:
             pass
         except Exception:
