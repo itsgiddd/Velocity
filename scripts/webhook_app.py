@@ -14,8 +14,28 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+# ---------------------------------------------------------------------------
+# PyInstaller bundled-mode path helpers
+# ---------------------------------------------------------------------------
+# When running from a PyInstaller --onedir bundle, data files live under
+# sys._MEIPASS.  When running as a plain script, they sit relative to __file__.
+_FROZEN = getattr(sys, "frozen", False)
+_BUNDLE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _res(relpath: str) -> str:
+    """Resolve a path to a bundled resource (read-only data files)."""
+    return os.path.join(_BUNDLE_DIR, relpath)
+
+def _local(relpath: str) -> str:
+    """Resolve a path to a writable local file (logs, settings, state)."""
+    return os.path.join(_SCRIPT_DIR, relpath)
+
 # Ensure project root is on sys.path so "from app.X" / "from models.X" etc. work
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+if _FROZEN:
+    sys.path.insert(0, _BUNDLE_DIR)
+else:
+    sys.path.insert(0, os.path.join(_SCRIPT_DIR, ".."))
 
 from PySide6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, Slot, QUrl
@@ -48,7 +68,7 @@ def _global_exception_hook(exc_type, exc_value, exc_tb):
     sys.__excepthook__(exc_type, exc_value, exc_tb)
 sys.excepthook = _global_exception_hook
 
-LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+LOG_DIR = _local("logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -78,7 +98,7 @@ TF_MAP = {
 TIMEFRAMES = list(TF_MAP.keys())
 
 MAGIC_NUMBER = 234567
-SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "aci_settings.json")
+SETTINGS_PATH = _local("aci_settings.json")
 
 # V4 partial close splits (1/3 at TP1, 1/3 at TP2, close rest at TP3)
 TP1_CLOSE_PCT = 0.33
@@ -89,8 +109,8 @@ MICRO_CLOSE_PCT = MICRO_TP_PCT  # 15% micro-partial at 0.8x ATR
 # Margin safety — require at least this % free margin after trade
 MIN_MARGIN_LEVEL_PCT = 150   # 150% margin level = safe zone
 
-# HTML UI file path
-HTML_UI_PATH = os.path.join(os.path.dirname(__file__), "v4_ui.html")
+# HTML UI file path (bundled resource)
+HTML_UI_PATH = _res(os.path.join("scripts", "v4_ui.html")) if _FROZEN else os.path.join(_SCRIPT_DIR, "v4_ui.html")
 
 
 
@@ -472,7 +492,7 @@ class ScanEngine(QObject):
 # V4 TP Manager — Full 5-layer profit capture system
 # Layers: Micro-Partial | Early BE | Tighter TPs | Post-TP1 Trail | Stall Exit
 # ---------------------------------------------------------------------------
-STATE_FILE = os.path.join(os.path.dirname(__file__), "tp_state.json")
+STATE_FILE = _local("tp_state.json")
 
 
 class TPManager(QObject):
@@ -1105,9 +1125,18 @@ class ACiApp(QMainWindow):
         self._channel.registerObject("v4bridge", self._bridge)
         self._web.page().setWebChannel(self._channel)
 
-        # Load HTML
+        # Load HTML — read file content and inject via setHtml to avoid
+        # file:// path issues in PyInstaller frozen builds
         html_path = os.path.abspath(HTML_UI_PATH)
-        self._web.setUrl(QUrl.fromLocalFile(html_path))
+        log.info(f"Loading UI from: {html_path} (exists={os.path.exists(html_path)})")
+        if os.path.exists(html_path):
+            with open(html_path, "r", encoding="utf-8") as f:
+                html_content = f.read()
+            base_url = QUrl.fromLocalFile(html_path)
+            self._web.setHtml(html_content, base_url)
+        else:
+            log.error(f"v4_ui.html NOT FOUND at {html_path}")
+            self._web.setHtml("<h1 style='color:white;background:#0B0B11;padding:40px;font-family:sans-serif'>Error: v4_ui.html not found</h1>")
         self._web.loadFinished.connect(self._on_web_loaded)
 
         layout.addWidget(self._web)
