@@ -189,6 +189,9 @@ config/
 !zeropoint_neural_model.pth
 !flip_predictor_model.pth
 !settings.json
+!Velocity4.spec
+!requirements.txt
+!.github/workflows/*.yml
 
 # Trading specific files
 *.trade

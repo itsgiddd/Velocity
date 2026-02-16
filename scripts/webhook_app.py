@@ -14,8 +14,28 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+# ---------------------------------------------------------------------------
+# PyInstaller bundled-mode path helpers
+# ---------------------------------------------------------------------------
+# When running from a PyInstaller --onedir bundle, data files live under
+# sys._MEIPASS.  When running as a plain script, they sit relative to __file__.
+_FROZEN = getattr(sys, "frozen", False)
+_BUNDLE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _res(relpath: str) -> str:
+    """Resolve a path to a bundled resource (read-only data files)."""
+    return os.path.join(_BUNDLE_DIR, relpath)
+
+def _local(relpath: str) -> str:
+    """Resolve a path to a writable local file (logs, settings, state)."""
+    return os.path.join(_SCRIPT_DIR, relpath)
+
 # Ensure project root is on sys.path so "from app.X" / "from models.X" etc. work
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+if _FROZEN:
+    sys.path.insert(0, _BUNDLE_DIR)
+else:
+    sys.path.insert(0, os.path.join(_SCRIPT_DIR, ".."))
 
 from PySide6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout
 from PySide6.QtCore import Qt, QTimer, Signal, QObject, Slot, QUrl
@@ -48,7 +68,7 @@ def _global_exception_hook(exc_type, exc_value, exc_tb):
     sys.__excepthook__(exc_type, exc_value, exc_tb)
 sys.excepthook = _global_exception_hook
 
-LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+LOG_DIR = _local("logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -71,6 +91,8 @@ TF_MAP = {
     "M15": mt5.TIMEFRAME_M15,
     "M30": mt5.TIMEFRAME_M30,
     "H1": mt5.TIMEFRAME_H1,
+    "H2": mt5.TIMEFRAME_H2,
+    "H3": mt5.TIMEFRAME_H3,
     "H4": mt5.TIMEFRAME_H4,
     "D1": mt5.TIMEFRAME_D1,
     "W1": mt5.TIMEFRAME_W1,
@@ -78,7 +100,7 @@ TF_MAP = {
 TIMEFRAMES = list(TF_MAP.keys())
 
 MAGIC_NUMBER = 234567
-SETTINGS_PATH = os.path.join(os.path.dirname(__file__), "aci_settings.json")
+SETTINGS_PATH = _local("aci_settings.json")
 
 # V4 partial close splits (1/3 at TP1, 1/3 at TP2, close rest at TP3)
 TP1_CLOSE_PCT = 0.33
@@ -89,8 +111,8 @@ MICRO_CLOSE_PCT = MICRO_TP_PCT  # 15% micro-partial at 0.8x ATR
 # Margin safety — require at least this % free margin after trade
 MIN_MARGIN_LEVEL_PCT = 150   # 150% margin level = safe zone
 
-# HTML UI file path
-HTML_UI_PATH = os.path.join(os.path.dirname(__file__), "v4_ui.html")
+# HTML UI file path (bundled resource)
+HTML_UI_PATH = _res(os.path.join("scripts", "v4_ui.html")) if _FROZEN else os.path.join(_SCRIPT_DIR, "v4_ui.html")
 
 
 
@@ -179,15 +201,22 @@ class ScanEngine(QObject):
             lot = round(lot / vol_step) * vol_step
             lot = max(sym_info.volume_min, min(lot, sym_info.volume_max))
 
-            cap_table = [
-                (500, 0.10), (1000, 0.20), (3000, 0.50),
-                (5000, 1.00), (10000, 2.00), (50000, 5.00),
-                (float('inf'), 10.00),
-            ]
-            for threshold, max_lot in cap_table:
-                if balance <= threshold:
-                    lot = min(lot, max_lot)
-                    break
+            lot_cap_mode = getattr(self, '_lot_cap_mode', 'conservative')
+            if lot_cap_mode == "ecn":
+                lot = min(lot, 100.00)
+            elif lot_cap_mode == "custom":
+                custom_max = getattr(self, '_custom_max_lot', 10.00)
+                lot = min(lot, custom_max)
+            else:  # conservative (tiered)
+                cap_table = [
+                    (500, 0.10), (1000, 0.20), (3000, 0.50),
+                    (5000, 1.00), (10000, 2.00), (50000, 5.00),
+                    (float('inf'), 10.00),
+                ]
+                for threshold, max_lot in cap_table:
+                    if balance <= threshold:
+                        lot = min(lot, max_lot)
+                        break
 
             self.log_message.emit(f"  Lot: balance=${balance:.0f} risk=${risk_amount:.0f} lot={lot:.2f}")
             return lot
@@ -242,7 +271,8 @@ class ScanEngine(QObject):
 
     # ── Main scan loop ──
 
-    def start_scanning(self, symbols, tf_key, poll_interval, risk_pct, default_lot, max_trades):
+    def start_scanning(self, symbols, tf_key, poll_interval, risk_pct, default_lot, max_trades,
+                        lot_cap_mode="conservative", custom_max_lot=10.00):
         self._symbols = symbols
         self._tf_key = tf_key
         self._tf_mt5 = TF_MAP.get(tf_key, mt5.TIMEFRAME_H4)
@@ -250,6 +280,8 @@ class ScanEngine(QObject):
         self._risk_pct = risk_pct
         self._default_lot = default_lot
         self._max_trades = max_trades
+        self._lot_cap_mode = lot_cap_mode
+        self._custom_max_lot = custom_max_lot
         self._running = True
 
         t = threading.Thread(target=self._scan_loop, daemon=True)
@@ -324,8 +356,8 @@ class ScanEngine(QObject):
         if resolved is None:
             return
 
-        # Fetch OHLCV — 1000 bars for full historical view
-        rates = mt5.copy_rates_from_pos(resolved, self._tf_mt5, 0, 1000)
+        # Fetch OHLCV — 5000 bars for full historical view (~3 years on H4)
+        rates = mt5.copy_rates_from_pos(resolved, self._tf_mt5, 0, 5000)
         if rates is None or len(rates) < 20:
             return
 
@@ -472,7 +504,7 @@ class ScanEngine(QObject):
 # V4 TP Manager — Full 5-layer profit capture system
 # Layers: Micro-Partial | Early BE | Tighter TPs | Post-TP1 Trail | Stall Exit
 # ---------------------------------------------------------------------------
-STATE_FILE = os.path.join(os.path.dirname(__file__), "tp_state.json")
+STATE_FILE = _local("tp_state.json")
 
 
 class TPManager(QObject):
@@ -1027,6 +1059,12 @@ class ACiApp(QMainWindow):
         self.setMinimumSize(1100, 750)
         self.resize(1400, 900)
 
+        # Set window icon (taskbar + title bar)
+        icon_path = _res(os.path.join("assets", "velocity4.png")) if _FROZEN else os.path.join(_SCRIPT_DIR, "..", "assets", "velocity4.png")
+        if os.path.exists(icon_path):
+            from PySide6.QtGui import QIcon
+            self.setWindowIcon(QIcon(icon_path))
+
         self._scanner = None
         self._running = False
         self._trading_enabled = False
@@ -1034,11 +1072,15 @@ class ACiApp(QMainWindow):
         self._chart_loaded = {}     # {symbol: bool}
         self._starting_balance = None  # set on first MT5 connect for growth calc
         self._current_pair = "EURUSD"
+        self._last_pos_count = -1  # track position changes for portfolio refresh
 
         # Settings dict — replaces per-widget reads
         self._settings = {
             "risk": "30", "lots": "0.40", "max_trades": "5",
             "poll_sec": "30", "timeframe": "H4",
+            "risk_profile": "aggressive",        # conservative/moderate/aggressive/ultra/custom
+            "lot_cap_mode": "conservative",       # conservative/ecn/custom
+            "custom_max_lot": "10.00",
             "pairs": {s: True for s in ALL_PAIRS},
             "v4_tp1": str(TP1_MULT_AGG), "v4_tp2": str(TP2_MULT_AGG),
             "v4_tp3": str(TP3_MULT_AGG),
@@ -1067,20 +1109,20 @@ class ACiApp(QMainWindow):
         # MT5 check on startup
         self._check_mt5()
 
-        # Live position refresh (2s)
+        # Live position + account refresh (2s)
         self._timer = QTimer()
         self._timer.timeout.connect(self._update_live)
         self._timer.start(2000)
 
-        # Portfolio refresh (60s — deal history doesn't change every tick)
+        # Portfolio stats + equity curve refresh (15s)
         self._portfolio_timer = QTimer()
         self._portfolio_timer.timeout.connect(self._push_portfolio)
-        self._portfolio_timer.start(60000)
+        self._portfolio_timer.start(15000)
 
-        # Market news refresh (5 min — calendar data doesn't change fast)
+        # Market news + sentiment refresh (2 min)
         self._news_timer = QTimer()
         self._news_timer.timeout.connect(self._fetch_and_push_news)
-        self._news_timer.start(300000)
+        self._news_timer.start(120000)
 
     # ── Build Web UI ──
 
@@ -1105,9 +1147,18 @@ class ACiApp(QMainWindow):
         self._channel.registerObject("v4bridge", self._bridge)
         self._web.page().setWebChannel(self._channel)
 
-        # Load HTML
+        # Load HTML — read file content and inject via setHtml to avoid
+        # file:// path issues in PyInstaller frozen builds
         html_path = os.path.abspath(HTML_UI_PATH)
-        self._web.setUrl(QUrl.fromLocalFile(html_path))
+        log.info(f"Loading UI from: {html_path} (exists={os.path.exists(html_path)})")
+        if os.path.exists(html_path):
+            with open(html_path, "r", encoding="utf-8") as f:
+                html_content = f.read()
+            base_url = QUrl.fromLocalFile(html_path)
+            self._web.setHtml(html_content, base_url)
+        else:
+            log.error(f"v4_ui.html NOT FOUND at {html_path}")
+            self._web.setHtml("<h1 style='color:white;background:#0B0B11;padding:40px;font-family:sans-serif'>Error: v4_ui.html not found</h1>")
         self._web.loadFinished.connect(self._on_web_loaded)
 
         layout.addWidget(self._web)
@@ -1221,21 +1272,25 @@ class ACiApp(QMainWindow):
 
     def _apply_settings(self, settings):
         """Apply settings dict received from JS bridge."""
+        old_tf = self._settings.get("timeframe")
+        old_risk = self._settings.get("risk")
+        old_lot_cap = self._settings.get("lot_cap_mode")
         self._settings.update(settings)
         self._push_v4_params()
         self._save_settings()
-        self._log("Settings updated from UI")
+        self._log("Settings saved")
 
-        # If scanner is running and TF changed, restart it
-        new_tf = settings.get("timeframe")
-        if new_tf and self._running and self._scanner:
-            old_tf = self._settings.get("_active_tf")
-            if old_tf and old_tf != new_tf:
-                self._log(f"Timeframe changed to {new_tf} — restarting scanner")
+        # Restart scanner if execution params changed while running
+        if self._running and self._scanner:
+            new_tf = settings.get("timeframe", old_tf)
+            new_risk = settings.get("risk", old_risk)
+            new_lot_cap = settings.get("lot_cap_mode", old_lot_cap)
+            if new_tf != old_tf or new_risk != old_risk or new_lot_cap != old_lot_cap:
+                self._log(f"Execution settings changed — restarting scanner")
                 self._on_stop()
                 self._on_start()
-        if new_tf:
-            self._settings["_active_tf"] = new_tf
+        if settings.get("timeframe"):
+            self._settings["_active_tf"] = settings["timeframe"]
 
     # ── Start/Stop ──
 
@@ -1258,6 +1313,8 @@ class ACiApp(QMainWindow):
         risk = float(self._settings.get("risk", "30") or "30") / 100
         lots = float(self._settings.get("lots", "0.40") or "0.40")
         max_trades = int(self._settings.get("max_trades", "5") or "5")
+        lot_cap_mode = self._settings.get("lot_cap_mode", "conservative")
+        custom_max_lot = float(self._settings.get("custom_max_lot", "10.00") or "10.00")
 
         self._scanner = ScanEngine()
         self._scanner._auto_trade = self._trading_enabled
@@ -1265,11 +1322,12 @@ class ACiApp(QMainWindow):
         self._scanner.signal_detected.connect(self._on_signal)
         self._scanner.scan_complete.connect(self._on_scan_data)
         self._push_v4_params()
-        self._scanner.start_scanning(symbols, tf_key, poll, risk, lots, max_trades)
+        self._scanner.start_scanning(symbols, tf_key, poll, risk, lots, max_trades,
+                                     lot_cap_mode, custom_max_lot)
 
         self._running = True
         self._settings["_active_tf"] = tf_key
-        self._push_to_js(f"updateScannerState(true, {json.dumps(self._trading_enabled)})")
+        self._push_to_js(f"updateScannerState(true, {json.dumps(self._trading_enabled)}, '{tf_key}')")
         self._save_settings()
 
     def _on_stop(self):
@@ -1516,6 +1574,13 @@ class ACiApp(QMainWindow):
             # Push positions data to JS
             self._push_positions()
 
+            # Detect position count change → immediate portfolio refresh
+            positions = mt5.positions_get()
+            pos_count = len([p for p in (positions or []) if p.magic == MAGIC_NUMBER])
+            if self._last_pos_count >= 0 and pos_count != self._last_pos_count:
+                QTimer.singleShot(2000, self._push_portfolio)
+            self._last_pos_count = pos_count
+
         except Exception:
             pass
 
@@ -1743,6 +1808,28 @@ class ACiApp(QMainWindow):
             pair_list.sort(key=lambda x: x["net"], reverse=True)
 
             self._push_to_js(f"updatePortfolioPairs({json.dumps(pair_list)})")
+
+            # ── Recent individual trades for portfolio trade log ──
+            recent_trades = []
+            for deal in close_deals[-30:]:  # last 30 trades
+                pnl = deal.profit + deal.commission + deal.swap
+                sym = deal.symbol.upper().replace(".", "").replace("#", "")
+                for base in ALL_PAIRS:
+                    if sym.startswith(base):
+                        sym = base
+                        break
+                direction = "BUY" if deal.type == mt5.DEAL_TYPE_BUY else "SELL"
+                deal_time = datetime.fromtimestamp(deal.time).strftime("%b %d %H:%M")
+                recent_trades.append({
+                    "symbol": sym,
+                    "direction": direction,
+                    "lots": deal.volume,
+                    "pnl": round(pnl, 2),
+                    "time": deal_time,
+                    "win": pnl >= 0,
+                })
+            recent_trades.reverse()  # newest first
+            self._push_to_js(f"updateRecentTrades({json.dumps(recent_trades)})")
 
         except Exception as e:
             log.warning(f"Portfolio push error: {e}")

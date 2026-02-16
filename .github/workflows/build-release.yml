@@ -1,0 +1,65 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller Velocity4.spec --noconfirm
+
+      - name: Zip release
+        run: |
+          cd dist
+          Compress-Archive -Path Velocity4 -DestinationPath Velocity4-${{ github.ref_name }}-win64.zip
+        shell: pwsh
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Velocity 4 ${{ github.ref_name }}
+          files: dist/Velocity4-${{ github.ref_name }}-win64.zip
+          body: |
+            ## Velocity 4 — Smart Money Trading System
+
+            **V4 Profit Capture Engine** with 97.6% win rate backtested over 1,101 trades.
+
+            ### What's included
+            - `Velocity4.exe` — Standalone Windows application (no Python install needed)
+            - Modern web-based dashboard with real-time charts, portfolio tracking, market news
+            - ZeroPoint ATR trailing stop system with V4 profit capture (early BE, micro-partials, stall exit, trailing)
+            - 8 forex pairs: AUDUSD, EURJPY, EURUSD, GBPJPY, GBPUSD, NZDUSD, USDCAD, USDJPY
+
+            ### Requirements
+            - Windows 10/11 (64-bit)
+            - MetaTrader 5 terminal installed and running
+            - MT5 account with broker (tested with Coinexx 1:500 leverage)
+
+            ### Quick Start
+            1. Extract the zip file
+            2. Open MetaTrader 5 and log into your account
+            3. Run `Velocity4.exe`
+            4. Enable Auto Trade from the header pill button
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

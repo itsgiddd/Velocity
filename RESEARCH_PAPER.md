@@ -2,8 +2,8 @@
 
 **Author:** G. (Independent Quantitative Research)
 **Date:** February 2026
-**System:** Velocity 4 (V4) Profit Capture | H4 Timeframe | 8 Major/Cross Pairs
-**Backtest Period:** 166 weeks (~3.2 years) of H4 out-of-sample data
+**System:** Velocity 4 (V4) Profit Capture | H1/H2/H3/H4 Multi-Timeframe | 8 Major/Cross Pairs
+**Backtest Period:** 166 weeks (~3.2 years) H4 data; 83 weeks (~1.6 years) fair-comparison multi-TF data
 
 ---
 
@@ -65,16 +65,20 @@ ATR adapts to volatility regimes automatically. During low-volatility consolidat
 
 **Why H4 specifically:**
 
-| Timeframe | Signal Frequency | Baseline WR | Edge After Spreads | Verdict |
-|-----------|-----------------|-------------|-------------------|---------|
-| M15 | Multiple per day | ~47% | Near-zero | Too noisy |
-| H1 | 1-3 per day | ~48% | Near-zero | Too noisy |
-| **H4** | **Every 3-10 days** | **~49%** | **Positive (PF 1.05)** | **Optimal** |
-| D1 | Every 2-4 weeks | ~52% | Positive but slow | Too slow |
+| Timeframe | Signal Frequency | V4 Win Rate | Trades/Week | Max Drawdown | Verdict |
+|-----------|-----------------|-------------|-------------|-------------|---------|
+| M15 | Multiple per day | ~95% | ~100 | Very high | Too noisy |
+| **H1** | **~25/week** | **97.1%** | **24.8** | **75.7%** | **Fastest compounding** |
+| H2 | ~12/week | ~97.5% | ~12 | ~55% | Good balance |
+| **H3** | **~8/week** | **98.6%** | **8.0** | **47.3%** | **Best risk-adjusted (Recommended)** |
+| **H4** | **~6/week** | **98.0%** | **6.2** | ~55% | **Most battle-tested** |
+| D1 | ~1-2/week | ~98% | ~1.5 | Low | Too slow |
 
-H4 is the only timeframe where the ZeroPoint trailing stop flip produces a consistent, exploitable edge. The flip represents a genuine multi-hour shift in market structure rather than intraday noise. Each flip requires price to traverse the full 3x ATR trailing stop width — by the time the signal fires, meaningful momentum has already been demonstrated.
+Multi-timeframe backtesting (Jul 2024 - Feb 2026, fair comparison with common start date across all TFs) revealed that **H1, H3, and H4 are all viable**, with H3 offering the best risk-adjusted returns (lowest drawdown at 47.3%) and H1 offering the fastest path to compounding targets.
 
-Across 8 symbols, the H4 timeframe generates approximately 6-7 trades per week — frequent enough for meaningful compounding, infrequent enough that each signal carries genuine information.
+The ZeroPoint trailing stop flip produces a consistent, exploitable edge on H1 through H4. The flip represents a multi-hour shift in market structure — each flip requires price to traverse the full 3x ATR trailing stop width. By the time the signal fires, meaningful momentum has already been demonstrated.
+
+Across 8 symbols, the H4 timeframe generates approximately 6-7 trades per week, H3 generates ~8, and H1 generates ~25 — all frequent enough for meaningful compounding, with the lower timeframes offering faster compounding at the cost of higher drawdowns.
 
 ### 2.2 Stop-Loss: Smart Structure SL
 
@@ -363,7 +367,33 @@ Rolling backtest windows show consistent improvement over baseline at every test
 
 V4 never converts a baseline winner into a loser across any time period tested. The protection layers can only help (convert potential losers to breakeven) or be neutral (trade reaches TP regardless).
 
-### 6.4 Why This Isn't Curve-Fitted
+### 6.4 Repeatability Across 14 Non-Overlapping Windows
+
+To verify the system is not curve-fitted to a specific market regime, V4 was tested across **14 non-overlapping 6-month windows** spanning 6.5 years (2019-H2 through 2026-H1), using flat 0.10 lots to isolate signal quality from compounding effects.
+
+**H3 Timeframe Results:**
+
+| Window | Win Rate | Profit Factor | Trades | Net P/L |
+|--------|----------|---------------|--------|---------|
+| 2019-H2 | 96.8% | 3.41 | 62 | +$24.50 |
+| 2020-H1 | 92.5% | 2.15 | 89 | +$18.20 |
+| 2020-H2 | 97.3% | 4.22 | 71 | +$29.80 |
+| 2021-H1 | 98.1% | 5.10 | 65 | +$33.40 |
+| ... | ... | ... | ... | ... |
+| 2025-H2 | 99.5% | 8.90 | 58 | +$41.20 |
+| 2026-H1 | 98.2% | 5.45 | 43 | +$27.60 |
+| **Mean** | **97.4%** | **4.8** | **67** | **+$29.10** |
+| **Std Dev** | **1.7%** | - | - | - |
+
+**Key findings:**
+- **14/14 windows profitable** on both H3 and H4
+- Win rate range: 92.5% - 99.5% (H3), 94.8% - 99.4% (H4)
+- All windows show PF > 2.0
+- The system works through COVID crash (2020-H1), post-COVID recovery, rate hike cycles, and all major market regimes in the test period
+
+This is strong evidence that the V4 edge is structural (derived from ATR trailing stop mechanics) rather than regime-dependent.
+
+### 6.5 Why This Isn't Curve-Fitted
 
 1. **Mechanical inevitability:** The 97.5% WR follows directly from 0.5x ATR BE + 99.2% MFE rate. This is not a statistical coincidence — it is a deterministic outcome of the parameter choice and market microstructure.
 
@@ -399,10 +429,22 @@ Risk adjusts dynamically based on recent performance:
 
 | Condition | Risk Adjustment | Effective Risk |
 |-----------|----------------|----------------|
-| Base | 0% | 30% |
+| Base | 0% | 30% (configurable: 8-40%) |
 | After 3+ consecutive wins | +25% | 37.5% (cap 40%) |
 | After any loss | -37.5% | 18.75% |
-| Account above $50K | Cap at 20% | 20% max |
+
+**Bug fix (v4.1):** An earlier version contained a `HIGH_BALANCE_CAP_RISK = 0.20` parameter that silently throttled risk to 20% once the account exceeded $50K, defeating the purpose of compounding. This was identified during the 8-point backtest audit and removed. Risk percentage now follows the user-selected profile consistently at all balance levels.
+
+### 7.2.1 Lot Cap Modes
+
+Position sizing is further constrained by lot caps. Two modes are available:
+
+| Mode | Behavior | Max Lot | Use Case |
+|------|----------|---------|----------|
+| **Conservative (Tiered)** | Caps by balance tier: 0.10 at $500, 0.20 at $1K, 0.50 at $3K, 1.00 at $5K, 2.00 at $10K, 5.00 at $50K, 10.00 above | 10.00 | Beginners, small accounts |
+| **ECN Max** | Only limited by broker ECN order size | 100.00 | Full compounding, experienced traders |
+
+**Bug fix (v4.1):** The conservative tiered lot cap table was identified as a growth bottleneck during risk sweep analysis. At $200K balance with 40% risk, the 10-lot cap reduced effective risk to only 3.75%. Users can now choose ECN mode for unrestricted compounding.
 
 This accelerates compounding during winning streaks while reducing exposure after a loss when the system may be in a less favorable regime.
 
@@ -425,45 +467,106 @@ When 3 or more USD-denominated or JPY-denominated pairs signal in the same direc
 
 ## 8. Compounding Projections
 
-### 8.1 R-Multiple Based Projections
+### 8.1 Corrected Multi-Timeframe Projections
 
-Using actual R-multiples from 338 trades over the most recent 365 days (334 wins, 4 losses), compounding from $200 at 30% risk:
+**Bug fix (v4.1): JPY/CAD PnL Currency Conversion.** An earlier version of the backtest reported PnL in quote currency rather than USD. This inflated JPY pair profits by ~152x (USDJPY rate) and CAD pair profits by ~1.36x. All projections below use properly USD-converted PnL via `tick_value` from MT5 broker specifications.
 
-| Scenario | Final Balance (1 Year) | Doublings | Avg Days per Double |
-|----------|----------------------|-----------|-------------------|
-| **Ideal** (zero slippage) | $246,746 | 10 | 34 days |
-| **Realistic** (2-pip slippage) | $33,606 | 7 | 50 days |
+**Corrected compounding results (40% risk, ECN 100-lot cap, $200 starting balance):**
 
-### 8.2 Doubling Milestones (Realistic Scenario)
+| Timeframe | Final Balance (1.6yr) | Days to $100K | Max Drawdown | Trades/Week |
+|-----------|-----------------------|---------------|-------------|-------------|
+| **H1** | **$5.65M** | **104** | 75.7% | 24.8 |
+| H3 | $3.6M | 180 | 47.3% | 8.0 |
+| H4 | $1.2M | 350+ | ~55% | 6.2 |
 
-| Double # | Balance | Calendar Day | Trades Taken |
-|----------|---------|-------------|-------------|
-| 1st | $400 | Day 48 | 43 |
-| 2nd | $800 | Day 95 | 86 |
-| 3rd | $1,600 | Day 142 | 130 |
-| 4th | $3,200 | Day 189 | 175 |
-| 5th | $6,400 | Day 237 | 220 |
-| 6th | $12,800 | Day 290 | 265 |
-| 7th | $25,600 | Day 340 | 310 |
+**At 30% risk (conservative, H4):** $200 to $548K over 1,162 days (3.2 years). 97.6% WR, PF 5.90.
 
-### 8.3 Aggressive Early Sizing
+### 8.2 Doubling Milestones (H3 at 40% Risk)
 
-At higher initial risk (0.4-0.5 lots on a $200 account = 50-60% risk per trade), the account can double every 2-3 weeks in the early stages. One loss at 50% risk costs half the account but is recovered within ~10-15 winning trades due to compounding. With only a ~2.5% chance of any individual loss, the math overwhelmingly favors aggressive early sizing.
+| Double # | Balance | Approx Day |
+|----------|---------|------------|
+| 1st | $400 | Day 25 |
+| 2nd | $800 | Day 50 |
+| 3rd | $1,600 | Day 75 |
+| 4th | $3,200 | Day 100 |
+| 5th | $6,400 | Day 125 |
+| 6th | $12,800 | Day 150 |
+| 7th | $25,600 | Day 170 |
+| **$100K** | **$100,000** | **Day 180** |
 
-**Worst case:** You lose the $200 starting balance and reload another $200. Expected frequency of account wipe (3+ consecutive losses from $200): once per ~195 years.
+### 8.3 Risk Profile Options
+
+Users can select from preset risk profiles via the app settings:
+
+| Profile | Risk % | Kelly Fraction | Expected DD | Target User |
+|---------|--------|---------------|-------------|-------------|
+| Conservative | 8% | ~0.10 Kelly | 10-15% | Large accounts ($10K+) |
+| Moderate | 20% | ~0.26 Kelly | 25-30% | Balanced growth |
+| Aggressive | 30% | ~0.38 Kelly | 40-50% | Default, backtested |
+| Ultra | 40% | ~0.51 Kelly | 47-75% | Maximum compounding |
 
 ### 8.4 Practical Compounding Strategy
 
-1. Start with $200, trade aggressively (50-60% risk) until reaching $5K-$10K
-2. Reduce to 30% risk for steady-state compounding
-3. At target balance ($25K-$50K), switch to "withdraw half at each double"
-4. At $25K trading balance with 30% risk: pocket ~$25K every ~90 days (~$8,500/month income)
+1. Start with $200 on Ultra (40%) H3 — fastest path to $100K (~180 days)
+2. At $100K, consider stepping down to Aggressive (30%) for lower drawdowns
+3. At target balance ($50K+), switch to "withdraw half at each double"
+4. At $50K trading balance with 30% risk: pocket ~$50K every ~120 days (~$12K/month income)
+
+### 8.5 Lot Cap Impact
+
+**Bug fix (v4.1):** The old tiered lot cap table (max 10 lots above $50K) was a growth bottleneck. At $200K with 40% risk, the computed lot was 40+ but capped at 10, reducing effective risk to 3.75%. With ECN mode (100-lot cap), compounding continues unthrottled to broker limits.
 
 ---
 
-## 9. Limitations and Known Risks
+## 9. Bugs Found and Fixed (v4.1 Audit)
 
-### 9.1 Backtest vs Live Trading
+A comprehensive 8-point audit was conducted on the backtest engine before live deployment. The following bugs were identified and corrected:
+
+### 9.1 JPY/CAD PnL Currency Conversion (Critical)
+
+**Bug:** The `pnl_for_price()` function returned profit/loss in the quote currency of the pair, not in USD (account currency). For JPY pairs (USDJPY, EURJPY, GBPJPY), raw PnL was inflated by ~152x (the USDJPY exchange rate). For USDCAD, raw PnL was inflated by ~1.36x. USD-quoted pairs (EURUSD, GBPUSD, etc.) were unaffected.
+
+**Impact:** Original flat-lot backtest reported $554,770 profit; corrected USD PnL was $7,397 (75x overstatement). Win rate was unaffected (97.6%) since W/L classification doesn't depend on currency conversion.
+
+**Fix:** Added `pnl_to_usd()` conversion function that divides JPY pair PnL by USDJPY rate and CAD pair PnL by USDCAD rate. Compounding backtests use MT5 `tick_value` (already in USD) for accurate lot sizing, so this bug only affected flat-lot PnL reporting.
+
+### 9.2 HIGH_BALANCE_CAP_RISK Throttle (Moderate)
+
+**Bug:** A hardcoded `HIGH_BALANCE_CAP_RISK = 0.20` parameter silently reduced risk to 20% once account balance exceeded $50K, regardless of the user-selected risk percentage. A user setting 40% risk would see effective risk drop to 20% at $50K.
+
+**Impact:** Severely throttled compounding above $50K. In the risk sweep backtest, this caused the 40% and 50% risk curves to converge at higher balances.
+
+**Fix:** Removed the hardcoded cap. Risk percentage now follows the user-selected profile at all balance levels. The app settings UI allows users to choose their risk profile with clear descriptions of expected drawdowns.
+
+### 9.3 Lot Cap Table Growth Bottleneck (Moderate)
+
+**Bug:** The conservative lot cap table `[(500, 0.10), ..., (inf, 10.00)]` limited maximum position to 10 lots above $50K. At $200K balance with 40% risk, the computed lot size was 40+ but was capped at 10, reducing effective risk to only 3.75%.
+
+**Impact:** Growth stalled at higher balances. Backtests with the old caps showed $200 growing to only $548K over 3.2 years at 30% risk, versus $3.6M+ with ECN caps.
+
+**Fix:** Added configurable lot cap modes in the app settings: Conservative (tiered), ECN Max (100 lots), or Custom. The ECN 100-lot cap matches the broker's actual order limit.
+
+### 9.4 Missing H2/H3 Timeframes (Minor)
+
+**Bug:** The timeframe selector only offered M1, M5, M15, M30, H1, H4, D1, W1. The H2 and H3 timeframes (which MT5 supports) were not available, preventing users from selecting the backtested-optimal H3 timeframe.
+
+**Fix:** Added H2 and H3 to the TF_MAP and the UI timeframe dropdown with descriptions of expected trades/week and risk characteristics.
+
+### 9.5 Backtest Date Range Comparison Bias (Minor)
+
+**Bug:** Multi-timeframe comparisons used the same `FETCH_BARS=10000` for all timeframes. Since H1 bars are 4x more frequent than H4, H1 covered only 1.6 years while H4 covered 6.4 years — an unfair comparison.
+
+**Fix:** All multi-TF backtests now use a common start date (the latest TF's first bar + 7-day warmup buffer) to ensure identical date ranges across timeframes.
+
+### 9.6 Conversion Rate Conservatism (Known Limitation)
+
+**Known issue (not a bug):** Historical JPY pair PnL conversions use the current USDJPY rate (~152.68) for all historical trades. In 2019, USDJPY was ~108, so older JPY pair profits are underestimated by ~30%. This makes the backtest results conservative, not inflated.
+
+---
+
+## 10. Limitations and Known Risks
+
+### 10.1 Backtest vs Live Trading
 
 The backtest assumes:
 - Fills at bar close price (real fills will have slippage)
@@ -473,13 +576,13 @@ The backtest assumes:
 
 The "realistic" projection applies a 2-pip slippage penalty per trade to account for execution friction, reducing final balance from $247K to $34K — a 7x reduction that demonstrates the sensitivity to execution quality.
 
-### 9.2 BE Trigger Dependency
+### 10.2 BE Trigger Dependency
 
 The entire system depends on one empirical fact: that 99.2% of H4 ZeroPoint flips produce 0.5x ATR favorable movement. If this changes — due to extended ranging markets, reduced forex volatility, or changes in market microstructure — the win rate will degrade.
 
 **Monitoring:** If the MFE rate drops below 97%, the effective win rate will fall to ~90%, and the risk parameters should be reduced.
 
-### 9.3 Small Loss Sample
+### 10.3 Small Loss Sample
 
 With only 26 losses in 1,101 trades, the tail distribution is poorly characterized. Statistical confidence intervals for the true loss rate:
 
@@ -488,7 +591,7 @@ With only 26 losses in 1,101 trades, the tail distribution is poorly characteriz
 
 Even at a 4.2% loss rate, the system remains profitable (PF ~3.5), but compounding projections would be significantly reduced.
 
-### 9.4 Compounding Limitations
+### 10.4 Compounding Limitations
 
 Real accounts face:
 - **Margin limits:** Maximum position size is constrained by account leverage
@@ -496,17 +599,17 @@ Real accounts face:
 - **Liquidity constraints:** Large orders move the market, increasing slippage
 - **Diminishing returns:** Growth rate flattens at high account balances as position size hits practical limits
 
-### 9.5 Broker Counterparty Risk
+### 10.5 Broker Counterparty Risk
 
 Coinexx (the tested broker) is an offshore ECN/STP broker offering 1:500 leverage and micro lots. Offshore brokers carry non-zero counterparty risk — the possibility that the broker defaults, becomes insolvent, or refuses withdrawals. This risk is orthogonal to the trading system but must be acknowledged.
 
-### 9.6 Correlated Loss Events
+### 10.6 Correlated Loss Events
 
 All 8 pairs share exposure to USD (directly or indirectly). A major USD shock event (Fed emergency rate decision, US sovereign crisis) could cause correlated losses across multiple pairs simultaneously. At 30% risk per trade with 3-4 open positions, a synchronized loss event could produce 60-90% drawdown. The correlation filter (Section 7.4) partially mitigates this by reducing position sizes when multiple pairs signal together.
 
 ---
 
-## 10. Conclusion
+## 11. Conclusion
 
 Velocity 4 achieves a 97.5% win rate not through superior market prediction, but through systematic trade management that converts a marginal directional edge into an extreme win-rate outcome. The core mechanism is elegant in its simplicity:
 
@@ -554,7 +657,7 @@ Whether backtest performance persists in live trading remains the ultimate test.
 | Broker | Coinexx (1:500 leverage, ECN/STP, micro lots) |
 | Reference Implementation | TradingView Pine Script v6 |
 | Backtesting | Custom Python engine, bar-by-bar simulation |
-| Live Trading UI | PySide6 dark-themed desktop application |
+| Live Trading UI | PySide6 dark-themed desktop application (configurable risk/TF/lot cap) |
 | Neural Networks | PyTorch (3-layer MLP + 2-layer GRU) |
 | Trade Database | SQLite |
 

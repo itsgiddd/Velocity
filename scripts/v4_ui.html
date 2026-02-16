@@ -68,6 +68,8 @@
             outline: none; width: 70px; text-align: center; transition: border-color 0.2s;
         }
         .setting-input:focus { border-color: #A78BFA; }
+        select.setting-input { text-align: left; cursor: pointer; }
+        select.setting-input option { background: #13141B; color: white; }
         .log-line { font-family: 'Cascadia Code', 'Fira Code', monospace; font-size: 11px; line-height: 1.5; }
         .chart-wrapper { position: relative; width: 100%; height: 100%; min-height: 300px; }
         .chart-container { position: absolute; inset: 0; }
@@ -390,7 +392,7 @@
                     </div>
 
                     <!-- Row 3: Stat Cards -->
-                    <div class="grid grid-cols-4 gap-3">
+                    <div class="grid grid-cols-4 gap-3 mb-4">
                         <div class="bg-card rounded-2xl p-4 border border-border flex items-center gap-3">
                             <div class="w-10 h-10 rounded-xl bg-green/10 flex items-center justify-center flex-shrink-0">
                                 <i class="ph-fill ph-trend-up text-green text-lg"></i>
@@ -428,6 +430,33 @@
                             </div>
                         </div>
                     </div>
+
+                    <!-- Row 4: Recent Trades -->
+                    <div class="bg-card rounded-2xl p-5 border border-border flex flex-col" style="max-height: 340px;">
+                        <div class="flex items-center justify-between mb-3">
+                            <h3 class="text-[14px] font-bold flex items-center gap-2">
+                                <i class="ph-fill ph-clock-countdown text-purple"></i> Recent Trades
+                            </h3>
+                            <span class="text-[10px] text-muted font-semibold" id="recentTradeCount">Last 30 trades</span>
+                        </div>
+                        <div class="overflow-y-auto hide-scrollbar flex-1">
+                            <table class="w-full text-left whitespace-nowrap">
+                                <thead>
+                                    <tr class="text-muted text-[10px] uppercase tracking-wider border-b border-border/50">
+                                        <th class="pb-2 pt-1 font-semibold">Result</th>
+                                        <th class="pb-2 pt-1 font-semibold">Pair</th>
+                                        <th class="pb-2 pt-1 font-semibold">Side</th>
+                                        <th class="pb-2 pt-1 font-semibold text-right">Lots</th>
+                                        <th class="pb-2 pt-1 font-semibold text-right">P/L</th>
+                                        <th class="pb-2 pt-1 font-semibold text-right">Time</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="recentTradesBody" class="text-[12px]">
+                                    <tr><td colspan="6" class="py-6 text-center text-muted text-[12px]">No trade history yet</td></tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
                 </div>
 
                 <!-- ═══════════════════════════════════════════════ -->
@@ -440,6 +469,8 @@
                         <div class="flex gap-1 bg-card p-1 rounded-lg border border-border" id="tfSelector">
                             <button data-tf="M15" class="tf-btn px-2.5 py-1 text-[11px] font-semibold text-muted hover:text-white rounded transition">M15</button>
                             <button data-tf="H1" class="tf-btn px-2.5 py-1 text-[11px] font-semibold text-muted hover:text-white rounded transition">H1</button>
+                            <button data-tf="H2" class="tf-btn px-2.5 py-1 text-[11px] font-semibold text-muted hover:text-white rounded transition">H2</button>
+                            <button data-tf="H3" class="tf-btn px-2.5 py-1 text-[11px] font-semibold text-muted hover:text-white rounded transition">H3</button>
                             <button data-tf="H4" class="tf-btn px-2.5 py-1 text-[11px] font-semibold bg-border text-white rounded transition shadow-sm">H4</button>
                             <button data-tf="D1" class="tf-btn px-2.5 py-1 text-[11px] font-semibold text-muted hover:text-white rounded transition">D1</button>
                         </div>
@@ -556,76 +587,131 @@
                 <!-- ═══════════════════════════════════════════════ -->
                 <!-- VIEW 5: SETTINGS                                -->
                 <!-- ═══════════════════════════════════════════════ -->
-                <div id="view-settings" class="app-view flex-1">
-                    <h2 class="text-[22px] font-bold mb-4 tracking-tight flex items-center gap-2">
-                        <i class="ph-fill ph-gear text-muted"></i> Settings
-                    </h2>
+                <div id="view-settings" class="app-view flex-1" style="overflow-y: auto;">
+                    <div class="flex items-center justify-between mb-4">
+                        <h2 class="text-[22px] font-bold tracking-tight flex items-center gap-2">
+                            <i class="ph-fill ph-gear text-muted"></i> Settings
+                        </h2>
+                        <!-- Live Balance Badge -->
+                        <div class="flex items-center gap-3">
+                            <div class="bg-card rounded-xl px-4 py-2 border border-border flex items-center gap-2">
+                                <i class="ph-fill ph-vault text-purple/60 text-[14px]"></i>
+                                <span class="text-[11px] text-muted font-semibold uppercase">Balance</span>
+                                <span class="text-[16px] font-bold text-white" id="settingsBalance">$0.00</span>
+                            </div>
+                        </div>
+                    </div>
                     <div class="flex gap-4">
-                        <!-- V4 Profit Capture -->
-                        <div class="flex-1 bg-card rounded-2xl p-5 border border-border">
-                            <h3 class="text-[14px] font-bold mb-4 flex items-center gap-2">
-                                <i class="ph-fill ph-target text-green"></i> V4 Profit Capture
-                            </h3>
-                            <div class="mb-4">
-                                <div class="text-[10px] text-green font-semibold uppercase tracking-wider mb-2">Take Profits (x ATR)</div>
-                                <div class="flex gap-3 flex-wrap">
-                                    <label class="flex items-center gap-2 text-[12px] font-medium">TP1 <input id="setTP1" class="setting-input" value="0.8" data-key="v4_tp1"></label>
-                                    <label class="flex items-center gap-2 text-[12px] font-medium">TP2 <input id="setTP2" class="setting-input" value="2.0" data-key="v4_tp2"></label>
-                                    <label class="flex items-center gap-2 text-[12px] font-medium">TP3 <input id="setTP3" class="setting-input" value="5.0" data-key="v4_tp3"></label>
+                        <!-- LEFT COLUMN: Risk + Lot Cap + Timeframe -->
+                        <div class="flex-1 space-y-4">
+
+                            <!-- Risk Profile -->
+                            <div class="bg-card rounded-2xl p-5 border border-border">
+                                <h3 class="text-[14px] font-bold mb-3 flex items-center gap-2">
+                                    <i class="ph-fill ph-shield-warning text-yellow"></i> Risk Profile
+                                </h3>
+                                <select id="setRiskProfile" class="setting-input w-full text-left mb-2" data-key="risk_profile" onchange="onRiskProfileChange()">
+                                    <option value="conservative">Conservative (8%)</option>
+                                    <option value="moderate">Moderate (20%)</option>
+                                    <option value="aggressive" selected>Aggressive (30%)</option>
+                                    <option value="ultra">Ultra (40%)</option>
+                                    <option value="custom">Custom</option>
+                                </select>
+                                <div id="riskDescription" class="text-[11px] text-muted leading-relaxed mb-3">High risk per trade. Rapid compounding with 40-50% max drawdown possible. Backtested default.</div>
+                                <div id="riskCustomRow" class="hidden">
+                                    <label class="flex items-center gap-2 text-[11px] font-semibold text-muted uppercase">
+                                        Custom Risk %
+                                        <input id="setRisk" class="setting-input" value="30" data-key="risk">
+                                    </label>
                                 </div>
                             </div>
-                            <div class="mb-4">
-                                <div class="text-[10px] text-yellow font-semibold uppercase tracking-wider mb-2">Breakeven (x ATR)</div>
-                                <div class="flex gap-3 flex-wrap">
-                                    <label class="flex items-center gap-2 text-[12px] font-medium">BE Trigger <input id="setBETrigger" class="setting-input" value="0.5" data-key="v4_be_trigger"></label>
-                                    <label class="flex items-center gap-2 text-[12px] font-medium">BE Buffer <input id="setBEBuffer" class="setting-input" value="0.15" data-key="v4_be_buffer"></label>
+
+                            <!-- Lot Cap Mode -->
+                            <div class="bg-card rounded-2xl p-5 border border-border">
+                                <h3 class="text-[14px] font-bold mb-3 flex items-center gap-2">
+                                    <i class="ph-fill ph-scales text-blue"></i> Lot Sizing
+                                </h3>
+                                <select id="setLotCapMode" class="setting-input w-full text-left mb-2" data-key="lot_cap_mode" onchange="onLotCapChange()">
+                                    <option value="conservative" selected>Conservative (Tiered Caps)</option>
+                                    <option value="ecn">ECN Max (100 lots)</option>
+                                    <option value="custom">Custom Max Lot</option>
+                                </select>
+                                <div id="lotCapDescription" class="text-[11px] text-muted leading-relaxed mb-3">Limits lot size by account balance: 0.10 at $500, 1.00 at $5K, 10.00 at $50K+. Safest for smaller accounts.</div>
+                                <div id="lotCapCustomRow" class="hidden">
+                                    <label class="flex items-center gap-2 text-[11px] font-semibold text-muted uppercase">
+                                        Max Lot Size
+                                        <input id="setCustomMaxLot" class="setting-input" value="10.00" data-key="custom_max_lot">
+                                    </label>
+                                </div>
+                                <div class="mt-3 pt-3 border-t border-border/50">
+                                    <div class="flex gap-3">
+                                        <label class="flex flex-col gap-1 text-[11px] font-semibold text-muted uppercase">
+                                            Default Lots
+                                            <input id="setLots" class="setting-input" value="0.40" data-key="lots">
+                                        </label>
+                                        <label class="flex flex-col gap-1 text-[11px] font-semibold text-muted uppercase">
+                                            Max Trades
+                                            <input id="setMaxTrades" class="setting-input" value="5" data-key="max_trades">
+                                        </label>
+                                    </div>
                                 </div>
                             </div>
-                            <div>
-                                <div class="text-[10px] text-purple font-semibold uppercase tracking-wider mb-2">Micro-Partial & Trail</div>
-                                <div class="flex gap-3 flex-wrap">
-                                    <label class="flex items-center gap-2 text-[12px] font-medium">Micro <input id="setMicroTP" class="setting-input" value="0.8" data-key="v4_micro_tp"></label>
-                                    <label class="flex items-center gap-2 text-[12px] font-medium">Micro % <input id="setMicroPct" class="setting-input" value="15" data-key="v4_micro_pct"></label>
-                                    <label class="flex items-center gap-2 text-[12px] font-medium">Stall <input id="setStall" class="setting-input" value="6" data-key="v4_stall"> bars</label>
-                                    <label class="flex items-center gap-2 text-[12px] font-medium">Trail <input id="setTrail" class="setting-input" value="0.8" data-key="v4_trail"></label>
-                                </div>
+
+                            <!-- Timeframe -->
+                            <div class="bg-card rounded-2xl p-5 border border-border">
+                                <h3 class="text-[14px] font-bold mb-3 flex items-center gap-2">
+                                    <i class="ph-fill ph-clock text-green"></i> Timeframe
+                                </h3>
+                                <select id="setTimeframe" class="setting-input w-full text-left mb-2" data-key="timeframe" onchange="onTimeframeChange()">
+                                    <option value="M15">M15</option>
+                                    <option value="M30">M30</option>
+                                    <option value="H1">H1</option>
+                                    <option value="H2">H2</option>
+                                    <option value="H3">H3</option>
+                                    <option value="H4" selected>H4</option>
+                                    <option value="D1">D1</option>
+                                </select>
+                                <div id="tfDescription" class="text-[11px] text-muted leading-relaxed mb-3">~6 trades/week. Most stable and battle-tested. Slowest compounding.</div>
+                                <label class="flex flex-col gap-1 text-[11px] font-semibold text-muted uppercase mt-2">
+                                    Poll Interval (sec)
+                                    <input id="setPoll" class="setting-input" value="30" data-key="poll_sec">
+                                </label>
                             </div>
                         </div>
 
-                        <!-- Core Execution + Pairs -->
-                        <div class="space-y-4" style="width: 340px; flex-shrink: 0;">
+                        <!-- RIGHT COLUMN: V4 Profit Capture + Pairs -->
+                        <div class="space-y-4" style="width: 360px; flex-shrink: 0;">
+                            <!-- V4 Profit Capture -->
                             <div class="bg-card rounded-2xl p-5 border border-border">
                                 <h3 class="text-[14px] font-bold mb-4 flex items-center gap-2">
-                                    <i class="ph-fill ph-gear text-blue"></i> Execution
+                                    <i class="ph-fill ph-target text-green"></i> V4 Profit Capture
                                 </h3>
-                                <div class="grid grid-cols-2 gap-3">
-                                    <label class="flex flex-col gap-1 text-[11px] font-semibold text-muted uppercase">
-                                        Risk %
-                                        <input id="setRisk" class="setting-input w-full" value="30" data-key="risk">
-                                    </label>
-                                    <label class="flex flex-col gap-1 text-[11px] font-semibold text-muted uppercase">
-                                        Default Lots
-                                        <input id="setLots" class="setting-input w-full" value="0.40" data-key="lots">
-                                    </label>
-                                    <label class="flex flex-col gap-1 text-[11px] font-semibold text-muted uppercase">
-                                        Max Trades
-                                        <input id="setMaxTrades" class="setting-input w-full" value="5" data-key="max_trades">
-                                    </label>
-                                    <label class="flex flex-col gap-1 text-[11px] font-semibold text-muted uppercase">
-                                        Poll (sec)
-                                        <input id="setPoll" class="setting-input w-full" value="30" data-key="poll_sec">
-                                    </label>
-                                    <label class="flex flex-col gap-1 text-[11px] font-semibold text-muted uppercase col-span-2">
-                                        Timeframe
-                                        <select id="setTimeframe" class="setting-input w-full text-left" data-key="timeframe">
-                                            <option value="M1">M1</option><option value="M5">M5</option>
-                                            <option value="M15">M15</option><option value="M30">M30</option>
-                                            <option value="H1">H1</option><option value="H4" selected>H4</option>
-                                            <option value="D1">D1</option><option value="W1">W1</option>
-                                        </select>
-                                    </label>
+                                <div class="mb-4">
+                                    <div class="text-[10px] text-green font-semibold uppercase tracking-wider mb-2">Take Profits (x ATR)</div>
+                                    <div class="flex gap-3 flex-wrap">
+                                        <label class="flex items-center gap-2 text-[12px] font-medium">TP1 <input id="setTP1" class="setting-input" value="0.8" data-key="v4_tp1"></label>
+                                        <label class="flex items-center gap-2 text-[12px] font-medium">TP2 <input id="setTP2" class="setting-input" value="2.0" data-key="v4_tp2"></label>
+                                        <label class="flex items-center gap-2 text-[12px] font-medium">TP3 <input id="setTP3" class="setting-input" value="5.0" data-key="v4_tp3"></label>
+                                    </div>
+                                </div>
+                                <div class="mb-4">
+                                    <div class="text-[10px] text-yellow font-semibold uppercase tracking-wider mb-2">Breakeven (x ATR)</div>
+                                    <div class="flex gap-3 flex-wrap">
+                                        <label class="flex items-center gap-2 text-[12px] font-medium">BE Trigger <input id="setBETrigger" class="setting-input" value="0.5" data-key="v4_be_trigger"></label>
+                                        <label class="flex items-center gap-2 text-[12px] font-medium">BE Buffer <input id="setBEBuffer" class="setting-input" value="0.15" data-key="v4_be_buffer"></label>
+                                    </div>
+                                </div>
+                                <div>
+                                    <div class="text-[10px] text-purple font-semibold uppercase tracking-wider mb-2">Micro-Partial & Trail</div>
+                                    <div class="flex gap-3 flex-wrap">
+                                        <label class="flex items-center gap-2 text-[12px] font-medium">Micro <input id="setMicroTP" class="setting-input" value="0.8" data-key="v4_micro_tp"></label>
+                                        <label class="flex items-center gap-2 text-[12px] font-medium">Micro % <input id="setMicroPct" class="setting-input" value="15" data-key="v4_micro_pct"></label>
+                                        <label class="flex items-center gap-2 text-[12px] font-medium">Stall <input id="setStall" class="setting-input" value="6" data-key="v4_stall"> bars</label>
+                                        <label class="flex items-center gap-2 text-[12px] font-medium">Trail <input id="setTrail" class="setting-input" value="0.8" data-key="v4_trail"></label>
+                                    </div>
                                 </div>
                             </div>
+                            <!-- Trading Pairs -->
                             <div class="bg-card rounded-2xl p-5 border border-border">
                                 <h3 class="text-[14px] font-bold mb-3 flex items-center gap-2">
                                     <i class="ph-fill ph-globe text-pink"></i> Trading Pairs
@@ -633,6 +719,14 @@
                                 <div class="grid grid-cols-2 gap-2" id="pairToggles"></div>
                             </div>
                         </div>
+                    </div>
+
+                    <!-- Save Button -->
+                    <div class="flex items-center gap-3 mt-5 mb-2">
+                        <button id="btnSaveSettings" onclick="onSaveSettings()" class="px-6 py-2.5 rounded-xl font-bold text-[13px] bg-accent text-white hover:opacity-90 transition-opacity flex items-center gap-2">
+                            <i class="ph-bold ph-floppy-disk"></i> Save Settings
+                        </button>
+                        <span id="saveStatus" class="text-[12px] font-medium text-muted opacity-0 transition-opacity duration-300"></span>
                     </div>
                 </div>
 
@@ -707,12 +801,26 @@
             'setStall': 'v4_stall', 'setTrail': 'v4_trail',
             'setRisk': 'risk', 'setLots': 'lots',
             'setMaxTrades': 'max_trades', 'setPoll': 'poll_sec',
+            'setCustomMaxLot': 'custom_max_lot',
         };
         for (const [elemId, key] of Object.entries(fields)) {
             const el = document.getElementById(elemId);
             if (el && s[key] !== undefined) el.value = s[key];
         }
         if (s.timeframe) document.getElementById('setTimeframe').value = s.timeframe;
+
+        // Risk profile
+        if (s.risk_profile) {
+            document.getElementById('setRiskProfile').value = s.risk_profile;
+            onRiskProfileChange();
+        }
+        // Lot cap mode
+        if (s.lot_cap_mode) {
+            document.getElementById('setLotCapMode').value = s.lot_cap_mode;
+            onLotCapChange();
+        }
+        // Timeframe description
+        if (s.timeframe) onTimeframeChange();
 
         const pairs = s.pairs || {};
         ALL_PAIRS.forEach(p => {
@@ -824,8 +932,64 @@
         });
     }
 
-    // ── Settings Change Handler ──
-    function onSettingChange() {
+    // ── Settings Descriptions ──
+    const RISK_DESCRIPTIONS = {
+        conservative: 'Low risk per trade (8%). Slow, steady growth. Best for accounts over $10K or cautious traders.',
+        moderate: 'Balanced risk (20%). Good compounding with manageable drawdowns around 25-30%.',
+        aggressive: 'High risk per trade (30%). Rapid compounding with 40-50% max drawdown possible. Backtested default.',
+        ultra: 'Maximum growth (40%). Backtested $200 to $3.6M/yr on H3 but expect 47% drawdowns.',
+        custom: 'Set your own risk percentage. Higher = faster growth but deeper drawdowns.',
+    };
+    const RISK_VALUES = { conservative: '8', moderate: '20', aggressive: '30', ultra: '40' };
+
+    const LOT_CAP_DESCRIPTIONS = {
+        conservative: 'Limits lot size by account balance: 0.10 at $500, 1.00 at $5K, 10.00 at $50K+. Safest for smaller accounts.',
+        ecn: 'Only capped by broker ECN limit of 100 lots. Full compounding power unlocked. For experienced traders.',
+        custom: 'Set your own maximum lot size. Useful if your broker has specific limits.',
+    };
+
+    const TF_DESCRIPTIONS = {
+        M15: '~100 trades/week. Very high frequency. Not backtested for V4 profit capture.',
+        M30: '~50 trades/week. High frequency. Limited V4 backtest data.',
+        H1: '~25 trades/week. Fastest compounding to $100K (~104 days at 40%). Highest drawdown (75%).',
+        H2: '~12 trades/week. Good balance of trade frequency and stability.',
+        H3: '~8 trades/week. Best risk-adjusted returns. Lowest drawdown. Recommended.',
+        H4: '~6 trades/week. Most stable and battle-tested. Slowest compounding.',
+        D1: '~1-2 trades/week. Very slow. Minimal drawdown but limited compounding.',
+    };
+
+    function onRiskProfileChange() {
+        const profile = document.getElementById('setRiskProfile').value;
+        document.getElementById('riskDescription').textContent = RISK_DESCRIPTIONS[profile] || '';
+        const customRow = document.getElementById('riskCustomRow');
+        if (profile === 'custom') {
+            customRow.classList.remove('hidden');
+        } else {
+            customRow.classList.add('hidden');
+            document.getElementById('setRisk').value = RISK_VALUES[profile] || '30';
+        }
+    }
+
+    function onLotCapChange() {
+        const mode = document.getElementById('setLotCapMode').value;
+        document.getElementById('lotCapDescription').textContent = LOT_CAP_DESCRIPTIONS[mode] || '';
+        const customRow = document.getElementById('lotCapCustomRow');
+        if (mode === 'custom') {
+            customRow.classList.remove('hidden');
+        } else {
+            customRow.classList.add('hidden');
+        }
+    }
+
+    function onTimeframeChange() {
+        const tf = document.getElementById('setTimeframe').value;
+        document.getElementById('tfDescription').textContent = TF_DESCRIPTIONS[tf] || '';
+        state.currentTF = tf;
+        updateTFButtons();
+    }
+
+    // ── Collect Settings (no save) ──
+    function collectSettings() {
         const settings = {};
         document.querySelectorAll('.setting-input').forEach(el => {
             const key = el.dataset.key;
@@ -834,9 +998,26 @@
         const pairs = {};
         ALL_PAIRS.forEach(p => { const cb = document.getElementById('pair-' + p); pairs[p] = cb ? cb.checked : true; });
         settings.pairs = pairs;
+        return settings;
+    }
+
+    // ── Save Settings (explicit button) ──
+    function onSaveSettings() {
+        const settings = collectSettings();
         state.settings = settings;
         bridgeCall('updateSettings', settings);
+        // Show confirmation
+        const el = document.getElementById('saveStatus');
+        el.textContent = 'Settings saved';
+        el.classList.remove('text-muted');
+        el.classList.add('text-green');
+        el.style.opacity = '1';
+        setTimeout(() => { el.style.opacity = '0'; }, 2000);
     }
+
+    // Legacy: keep onSettingChange for pair toggle compatibility but make it a no-op
+    // (settings only save on explicit Save button click)
+    function onSettingChange() { /* no-op — use Save button */ }
 
     // ── Chart Management ──
     function createChartContainers() {
@@ -929,6 +1110,10 @@
         const posPL = document.getElementById('posOpenPL');
         posPL.textContent = (openPL >= 0 ? '+' : '') + fmt(openPL);
         posPL.className = 'text-xl font-bold ' + (openPL >= 0 ? 'text-green' : 'text-red');
+
+        // Update settings page balance
+        const settBal = document.getElementById('settingsBalance');
+        if (settBal) settBal.textContent = fmt(d.balance);
     }
 
     function updateV4Status(data) {
@@ -1143,11 +1328,42 @@
         }
     }
 
-    function updateScannerState(running, tradingEnabled) {
+    function updateRecentTrades(tradesData) {
+        const trades = typeof tradesData === 'string' ? JSON.parse(tradesData) : tradesData;
+        const fmt = (v) => '$' + Number(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        const tbody = document.getElementById('recentTradesBody');
+        const countEl = document.getElementById('recentTradeCount');
+
+        if (!trades || trades.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="6" class="py-6 text-center text-muted text-[12px]">No trade history yet</td></tr>';
+            countEl.textContent = 'Last 30 trades';
+            return;
+        }
+
+        countEl.textContent = trades.length + ' recent trades';
+        tbody.innerHTML = trades.map(t => {
+            const plColor = t.win ? 'text-green' : 'text-red';
+            const badge = t.win
+                ? '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-green/10 text-green text-[10px] font-bold"><i class="ph-bold ph-check-circle text-[9px]"></i>WIN</span>'
+                : '<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-red/10 text-red text-[10px] font-bold"><i class="ph-bold ph-x-circle text-[9px]"></i>LOSS</span>';
+            const dirColor = t.direction === 'BUY' ? 'text-green' : 'text-red';
+            return `<tr class="hover:bg-border/30 transition border-b border-border/40">
+                <td class="py-1.5">${badge}</td>
+                <td class="py-1.5 font-bold">${t.symbol}</td>
+                <td class="py-1.5 ${dirColor} font-bold text-[11px]">${t.direction}</td>
+                <td class="py-1.5 text-right">${Number(t.lots).toFixed(2)}</td>
+                <td class="py-1.5 text-right ${plColor} font-bold">${t.pnl >= 0 ? '+' : ''}${fmt(t.pnl)}</td>
+                <td class="py-1.5 text-right text-muted">${t.time}</td>
+            </tr>`;
+        }).join('');
+    }
+
+    function updateScannerState(running, tradingEnabled, tf) {
         state.scannerRunning = running;
         const badge = document.getElementById('scannerBadge');
+        const activeTF = tf || state.settings.timeframe || state.currentTF || 'H4';
         if (running) {
-            badge.innerHTML = '<div class="w-1.5 h-1.5 rounded-full bg-green pulse-dot"></div><span>Scanner RUNNING</span>';
+            badge.innerHTML = '<div class="w-1.5 h-1.5 rounded-full bg-green pulse-dot"></div><span>' + activeTF + ' Scanner RUNNING</span>';
         } else {
             badge.innerHTML = '<div class="w-1.5 h-1.5 rounded-full bg-red"></div><span>Scanner OFF</span>';
         }
@@ -1462,9 +1678,7 @@
         }
     });
 
-    document.addEventListener('change', (e) => {
-        if (e.target.classList.contains('setting-input') || e.target.tagName === 'SELECT') onSettingChange();
-    });
+    // Settings no longer auto-save on change — user clicks "Save Settings" button
 
     // ── Init ──
     document.addEventListener('DOMContentLoaded', function() {
@@ -1475,9 +1689,8 @@
             btn.addEventListener('click', () => {
                 state.currentTF = btn.dataset.tf;
                 updateTFButtons();
-                const tfSelect = document.getElementById('setTimeframe');
-                if (tfSelect) tfSelect.value = state.currentTF;
-                onSettingChange();
+                // Reload chart data for the selected TF (view only, does not change scanner)
+                if (state.bridge) state.bridge.selectPair(state.currentPair);
             });
         });
 
