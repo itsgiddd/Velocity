@@ -25,27 +25,52 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
-          pip list | findstr -i "numpy pandas MetaTrader5 PySide6"
+        shell: cmd
+
+      - name: Show installed packages
+        run: pip list
+        shell: cmd
 
       - name: Verify imports before build
         run: |
           python -c "import numpy; print('numpy', numpy.__version__)"
           python -c "import pandas; print('pandas', pandas.__version__)"
           python -c "import PySide6; print('PySide6 OK')"
+        shell: cmd
 
       - name: Build with PyInstaller
         run: pyinstaller Velocity4.spec --noconfirm
+        shell: cmd
 
-      - name: Verify build output
+      - name: Verify build is not empty
         run: |
-          dir dist\Velocity4
-          python -c "import os; files = os.listdir('dist/Velocity4'); numpy_files = [f for f in files if 'numpy' in f.lower()]; print(f'numpy files in dist: {len(numpy_files)}'); [print(f'  {f}') for f in numpy_files[:20]]"
+          $exePath = "dist\Velocity4\Velocity4.exe"
+          if (-not (Test-Path $exePath)) {
+            Write-Error "BUILD FAILED: Velocity4.exe not found!"
+            exit 1
+          }
+          $size = (Get-Item $exePath).Length / 1MB
+          Write-Output "Velocity4.exe size: $([math]::Round($size, 2)) MB"
+          if ($size -lt 1) {
+            Write-Error "BUILD FAILED: exe is suspiciously small ($([math]::Round($size, 2)) MB)"
+            exit 1
+          }
+          $totalFiles = (Get-ChildItem -Recurse dist\Velocity4).Count
+          Write-Output "Total files in dist: $totalFiles"
+          if ($totalFiles -lt 50) {
+            Write-Error "BUILD FAILED: too few files in dist ($totalFiles), PyInstaller likely failed"
+            exit 1
+          }
+          $numpyFiles = (Get-ChildItem -Recurse dist\Velocity4 | Where-Object { $_.Name -match 'numpy' }).Count
+          Write-Output "numpy-related files: $numpyFiles"
         shell: pwsh
 
       - name: Zip release
         run: |
           cd dist
           Compress-Archive -Path Velocity4 -DestinationPath Velocity4-${{ github.ref_name }}-win64.zip
+          $zipSize = (Get-Item "Velocity4-${{ github.ref_name }}-win64.zip").Length / 1MB
+          Write-Output "Zip size: $([math]::Round($zipSize, 2)) MB"
         shell: pwsh
 
       - name: Create GitHub Release
