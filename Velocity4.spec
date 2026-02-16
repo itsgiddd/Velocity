@@ -33,6 +33,9 @@ a = Analysis(
         'MetaTrader5',
         # Data / Numeric
         'numpy',
+        'numpy._core',
+        'numpy._core._methods',
+        'numpy._core._dtype_ctypes',
         'pandas',
         # Standard lib commonly missed
         'json',
